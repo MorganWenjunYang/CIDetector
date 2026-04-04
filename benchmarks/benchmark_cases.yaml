@@ -1,0 +1,51 @@
+cases:
+  # --- REST API (most stable) ---
+  - name: "ClinicalTrials.gov"
+    tool: "tools/search_clinical_trials.py"
+    args: ["--query", "pembrolizumab", "--max-results", "3"]
+    requires_env: []
+
+  - name: "PubMed"
+    tool: "tools/search_pubmed.py"
+    args: ["--query", "EGFR inhibitor", "--max-results", "3"]
+    requires_env: []
+
+  # --- Tavily API (requires key) ---
+  - name: "WebSearch (Tavily)"
+    tool: "tools/web_search.py"
+    args: ["--query", "ADC oncology 2026", "--max-results", "3"]
+    requires_env: ["TAVILY_API_KEY"]
+
+  # --- HTML scraping (most fragile, breaks on site redesign) ---
+  - name: "China Trials (CDE)"
+    tool: "tools/search_china_trials.py"
+    args: ["--query", "PD-1", "--source", "cde", "--max-results", "3"]
+    requires_env: []
+
+  - name: "China Trials (ChiCTR)"
+    tool: "tools/search_china_trials.py"
+    args: ["--query", "PD-1", "--source", "chictr", "--max-results", "3"]
+    requires_env: []
+
+  - name: "Stock Disclosure (HKEX)"
+    tool: "tools/search_stock_disclosure.py"
+    args: ["--query", "信达生物", "--exchange", "hkex", "--max-results", "3"]
+    requires_env: []
+
+  - name: "Conferences (ASCO)"
+    tool: "tools/search_conferences.py"
+    args: ["--query", "pembrolizumab", "--conference", "asco", "--max-results", "3"]
+    requires_env: []
+
+  # --- RSS ---
+  - name: "RSS Monitor"
+    tool: "tools/rss_monitor.py"
+    args: ["--keyword", "", "--feeds", "fierce"]
+    requires_env: []
+
+  # --- Page fetch (different output structure) ---
+  - name: "Fetch Page"
+    tool: "tools/fetch_page.py"
+    args: ["--url", "https://www.fiercebiotech.com/", "--format", "text"]
+    requires_env: []
+    check_mode: "fetch_page"

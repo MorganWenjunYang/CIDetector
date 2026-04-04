@@ -10,3 +10,7 @@ node_modules/
 *.egg-info/
 dist/
 build/
+.worktrees/
+logs/*.log
+logs/*.json
+!logs/.gitkeep
