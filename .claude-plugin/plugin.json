@@ -1,0 +1,7 @@
+{
+  "name": "cidector",
+  "description": "生物医药竞争情报 Deep Research Agent — 多源数据采集与分析，覆盖 ClinicalTrials.gov、PubMed、中国 CDE、Tavily 网页搜索、学术会议、资本市场公告等",
+  "author": {
+    "name": "yangwenjun"
+  }
+}

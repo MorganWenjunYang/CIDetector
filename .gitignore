@@ -1,0 +1,12 @@
+.env
+.cache.db
+__pycache__/
+*.pyc
+.venv/
+reports/*.md
+reports/*.json
+!reports/.gitkeep
+node_modules/
+*.egg-info/
+dist/
+build/

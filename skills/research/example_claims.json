@@ -1,0 +1,46 @@
+{
+  "_description": "关键事实声明模板 - 用于 fact-check 模块验证",
+  "_usage": "python skills/research/fact_check.py --facts-file claims.json --output fact_check_report.md",
+  "_format": "key_claims 数组中的每个字符串是一条待验证的事实声明",
+
+  "key_claims": [
+    "Farxiga 2024 年销售额 77 亿美元",
+    "Tagrisso 2024 年销售额 65.8 亿美元",
+    "Imfinzi 2024 年销售额 47 亿美元",
+    "Lynparza 2024 年销售额 37 亿美元",
+    "Enhertu 2024 年 AZ 分成收入约 25 亿美元",
+    "Tozorakimab COPD Phase 3 试验 OBERON/TITANIA 双阳性",
+    "Datroway TNBC 适应症 PDUFA 日期 2026 年 6 月 2 日",
+    "Camizestrant SERENA-4/6 试验预计 2026 H2 读出",
+    "Baxdrostat 高血压适应症 PDUFA Q2 2026",
+    "阿斯利康中国区前总裁 Leon Wang 被起诉",
+    "阿斯利康 2025 年中国销售额 55 亿美元同比增长 4%",
+    "Farxiga 专利 2026 年到期",
+    "Lynparza 专利 2027-2030 年陆续到期",
+    "Tagrisso 专利 2031-2032 年到期",
+    "阿斯利康宣布 2030 年前对华投资 150 亿美元"
+  ],
+
+  "_az_pipeline_template": {
+    "sales_figures": [
+      "Farxiga 2024 年销售额 77 亿美元",
+      "Tagrisso 2024 年销售额 65.8 亿美元",
+      "Imfinzi 2024 年销售额 47 亿美元"
+    ],
+    "trial_status": [
+      "Tozorakimab COPD Phase 3 试验 OBERON/TITANIA 双阳性",
+      "Datroway TNBC 适应症 PDUFA 日期 2026 年 6 月 2 日"
+    ],
+    "patent_dates": [
+      "Farxiga 专利 2026 年到期",
+      "Lynparza 专利 2027-2030 年陆续到期"
+    ],
+    "regulatory": [
+      "Baxdrostat 高血压适应症 PDUFA Q2 2026"
+    ],
+    "other": [
+      "阿斯利康中国区前总裁 Leon Wang 被起诉",
+      "阿斯利康宣布 2030 年前对华投资 150 亿美元"
+    ]
+  }
+}
