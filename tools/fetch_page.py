@@ -21,11 +21,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from utils.parsers import parse_html, extract_text
 
 
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
 async def _fetch_static(url: str) -> str:
     import httpx
 
+    headers = {
+        "User-Agent": _USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
+    }
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.get(url)
+        resp = await client.get(url, headers=headers)
         resp.raise_for_status()
         return resp.text
 
@@ -126,7 +137,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    result = asyncio.run(fetch(args))
+    try:
+        result = asyncio.run(fetch(args))
+    except Exception as exc:
+        result = {
+            "source": "fetch_page",
+            "url": args.url,
+            "format": args.format,
+            "content": "",
+            "error": str(exc),
+        }
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

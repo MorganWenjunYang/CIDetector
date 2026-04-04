@@ -25,6 +25,9 @@ FEEDS: dict[str, dict] = {
     "fierce": {
         "name": "Fierce Biotech",
         "url": "https://www.fiercebiotech.com/rss/xml",
+        "fallback_urls": [
+            "https://www.fiercebiotech.com/rss/biotech/xml",
+        ],
     },
     "endpoints": {
         "name": "Endpoints News",
@@ -45,31 +48,42 @@ async def _fetch_feed(key: str, feed_info: dict, keyword: str) -> list[dict]:
     import feedparser
 
     items: list[dict] = []
-    try:
-        xml = await fetch_text(feed_info["url"], timeout=15)
-        parsed = feedparser.parse(xml)
+    urls_to_try = [feed_info["url"]] + feed_info.get("fallback_urls", [])
+    last_exc: Exception | None = None
 
-        for entry in parsed.entries:
-            title = entry.get("title", "")
-            summary = entry.get("summary", "")
-            link = entry.get("link", "")
-            published = entry.get("published", "")
-
-            if keyword and not (_match(keyword, title) or _match(keyword, summary)):
+    for url in urls_to_try:
+        try:
+            xml = await fetch_text(url, timeout=15)
+            parsed = feedparser.parse(xml)
+            if not parsed.entries:
                 continue
 
-            items.append({
-                "title": title,
-                "url": link,
-                "content": summary[:500],
-                "published_at": published,
-                "metadata": {"feed": feed_info["name"]},
-            })
-    except Exception as exc:
+            for entry in parsed.entries:
+                title = entry.get("title", "")
+                summary = entry.get("summary", "")
+                link = entry.get("link", "")
+                published = entry.get("published", "")
+
+                if keyword and not (_match(keyword, title) or _match(keyword, summary)):
+                    continue
+
+                items.append({
+                    "title": title,
+                    "url": link,
+                    "content": summary[:500],
+                    "published_at": published,
+                    "metadata": {"feed": feed_info["name"]},
+                })
+            return items
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    if last_exc is not None:
         items.append({
-            "title": f"[{feed_info['name']} feed error: {exc}]",
+            "title": f"[{feed_info['name']} feed error: {last_exc}]",
             "url": feed_info["url"],
-            "content": str(exc),
+            "content": str(last_exc),
             "published_at": "",
             "metadata": {"feed": feed_info["name"], "error": True},
         })

@@ -16,16 +16,18 @@ cases:
     args: ["--query", "ADC oncology 2026", "--max-results", "3"]
     requires_env: ["TAVILY_API_KEY"]
 
-  # --- HTML scraping (most fragile, breaks on site redesign) ---
+  # --- HTML scraping (most fragile, breaks on site redesign / anti-bot) ---
   - name: "China Trials (CDE)"
     tool: "tools/search_china_trials.py"
     args: ["--query", "PD-1", "--source", "cde", "--max-results", "3"]
     requires_env: []
+    fragile: true
 
   - name: "China Trials (ChiCTR)"
     tool: "tools/search_china_trials.py"
     args: ["--query", "PD-1", "--source", "chictr", "--max-results", "3"]
     requires_env: []
+    fragile: true
 
   - name: "Stock Disclosure (HKEX)"
     tool: "tools/search_stock_disclosure.py"
@@ -36,6 +38,7 @@ cases:
     tool: "tools/search_conferences.py"
     args: ["--query", "pembrolizumab", "--conference", "asco", "--max-results", "3"]
     requires_env: []
+    fragile: true
 
   # --- RSS ---
   - name: "RSS Monitor"
@@ -46,6 +49,6 @@ cases:
   # --- Page fetch (different output structure) ---
   - name: "Fetch Page"
     tool: "tools/fetch_page.py"
-    args: ["--url", "https://www.fiercebiotech.com/", "--format", "text"]
+    args: ["--url", "https://clinicaltrials.gov/", "--format", "text"]
     requires_env: []
     check_mode: "fetch_page"

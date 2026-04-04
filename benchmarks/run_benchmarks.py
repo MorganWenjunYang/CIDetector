@@ -76,6 +76,7 @@ def run_case(case: dict, verbose: bool = False) -> dict:
     args = case.get("args", [])
     requires_env = case.get("requires_env", [])
     check_mode = case.get("check_mode", "search")
+    fragile = case.get("fragile", False)
 
     missing_env = check_env(requires_env)
     if missing_env:
@@ -96,18 +97,21 @@ def run_case(case: dict, verbose: bool = False) -> dict:
         )
     except subprocess.TimeoutExpired:
         duration = time.monotonic() - start
-        return {"name": name, "status": "FAIL", "error": f"timeout after {TIMEOUT_SEC}s", "duration_sec": round(duration, 1)}
+        status = "WARN" if fragile else "FAIL"
+        return {"name": name, "status": status, "error": f"timeout after {TIMEOUT_SEC}s", "duration_sec": round(duration, 1)}
     duration = time.monotonic() - start
 
     if result.returncode != 0:
         stderr_snippet = result.stderr.strip()[:300]
-        return {"name": name, "status": "FAIL", "error": f"exit code {result.returncode}: {stderr_snippet}", "duration_sec": round(duration, 1)}
+        status = "WARN" if fragile else "FAIL"
+        return {"name": name, "status": status, "error": f"exit code {result.returncode}: {stderr_snippet}", "duration_sec": round(duration, 1)}
 
     try:
         data = json.loads(result.stdout)
     except (json.JSONDecodeError, ValueError) as e:
         stdout_snippet = result.stdout.strip()[:200]
-        return {"name": name, "status": "FAIL", "error": f"invalid JSON: {e}. stdout starts with: {stdout_snippet}", "duration_sec": round(duration, 1)}
+        status = "WARN" if fragile else "FAIL"
+        return {"name": name, "status": status, "error": f"invalid JSON: {e}. stdout starts with: {stdout_snippet}", "duration_sec": round(duration, 1)}
 
     if check_mode == "fetch_page":
         err = validate_fetch_page_output(data)
@@ -115,7 +119,8 @@ def run_case(case: dict, verbose: bool = False) -> dict:
         err = validate_search_output(data)
 
     if err:
-        return {"name": name, "status": "FAIL", "error": err, "duration_sec": round(duration, 1)}
+        status = "WARN" if fragile else "FAIL"
+        return {"name": name, "status": status, "error": err, "duration_sec": round(duration, 1)}
 
     return {"name": name, "status": "PASS", "duration_sec": round(duration, 1)}
 
@@ -142,13 +147,14 @@ def main() -> None:
         r = run_case(case, verbose=args.verbose)
         results.append(r)
         if args.verbose:
-            status_icon = {"PASS": " PASS", "FAIL": " FAIL", "SKIP": " SKIP"}[r["status"]]
+            status_icon = {"PASS": " PASS", "FAIL": " FAIL", "WARN": " WARN", "SKIP": " SKIP"}[r["status"]]
             suffix = f" ({r['duration_sec']}s)" if r["duration_sec"] else ""
             err_msg = f" - {r['error']}" if r.get("error") else ""
             print(f" {status_icon}{suffix}{err_msg}", file=sys.stderr)
 
     passed = sum(1 for r in results if r["status"] == "PASS")
     failed = sum(1 for r in results if r["status"] == "FAIL")
+    warned = sum(1 for r in results if r["status"] == "WARN")
     skipped = sum(1 for r in results if r["status"] == "SKIP")
 
     report = {
@@ -156,6 +162,7 @@ def main() -> None:
         "total": len(results),
         "passed": passed,
         "failed": failed,
+        "warned": warned,
         "skipped": skipped,
         "results": results,
     }

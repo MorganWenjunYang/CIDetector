@@ -86,6 +86,34 @@ def _gh_available() -> bool:
         return False
 
 
+def _ensure_labels_exist() -> None:
+    """Create the required labels if they don't already exist in the repo."""
+    labels = {
+        ISSUE_LABEL: {"description": "Auto-fix target for Claude", "color": "d876e3"},
+        BENCHMARK_LABEL: {"description": "Benchmark test failure", "color": "e11d48"},
+    }
+    for name, meta in labels.items():
+        result = _run(
+            ["gh", "label", "list", "--search", name, "--json", "name", "--limit", "1"],
+            check=False,
+        )
+        already_exists = False
+        if result.returncode == 0:
+            try:
+                found = json.loads(result.stdout)
+                already_exists = any(l.get("name") == name for l in found)
+            except json.JSONDecodeError:
+                pass
+        if not already_exists:
+            _run(
+                ["gh", "label", "create", name,
+                 "--description", meta["description"],
+                 "--color", meta["color"]],
+                check=False,
+            )
+            logger.info("Created label: %s", name)
+
+
 def _claude_available() -> bool:
     return shutil.which("claude") is not None
 
@@ -101,56 +129,100 @@ def _save_benchmark_report(report: dict) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Issue body formatting
+# Issue selection & formatting
 # ---------------------------------------------------------------------------
 
-def _format_issue_body(report: dict) -> str:
-    """Build a Markdown issue body from a benchmark report."""
+_SEVERITY_ORDER = {"FAIL": 0, "WARN": 1}
+
+
+def _pick_most_critical(report: dict) -> dict | None:
+    """Pick the single most critical non-passing result from the report.
+
+    Priority: FAIL before WARN, then by duration (slower = more impactful).
+    """
+    candidates = [
+        r for r in report["results"]
+        if r["status"] in _SEVERITY_ORDER
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda r: (
+        _SEVERITY_ORDER.get(r["status"], 99),
+        -r.get("duration_sec", 0),
+    ))
+    return candidates[0]
+
+
+def _build_issue_title(case: dict, date_str: str) -> str:
+    status_tag = "FAIL" if case["status"] == "FAIL" else "WARN"
+    return f"[Benchmark][{status_tag}] {case['name']} ({date_str})"
+
+
+def _build_issue_body(case: dict, report: dict) -> str:
+    """Build a structured issue body for a single benchmark failure."""
+    error_text = case.get("error", "unknown error")
+    tool_cmd = ""
+    for c in _load_benchmark_cases():
+        if c["name"] == case["name"]:
+            tool_cmd = f"python {c['tool']} {' '.join(c.get('args', []))}"
+            break
+
     lines: list[str] = []
-    lines.append(f"## Benchmark Report — {report.get('timestamp', 'N/A')}")
+
+    lines.append("## Problem")
     lines.append("")
-    lines.append(f"**Total**: {report['total']} · "
-                 f"**Passed**: {report['passed']} · "
-                 f"**Failed**: {report['failed']} · "
-                 f"**Skipped**: {report['skipped']}")
+    lines.append(f"Benchmark **{case['name']}** returned status **{case['status']}** "
+                 f"during the automated benchmark run on `{report.get('timestamp', 'N/A')[:10]}`.")
     lines.append("")
 
-    failures = [r for r in report["results"] if r["status"] == "FAIL"]
-    if failures:
-        lines.append("### Failed Cases")
+    lines.append("## Expected Behavior")
+    lines.append("")
+    lines.append(f"- `{case['name']}` should return **at least 1 real result item** "
+                 f"(no error markers) and exit with code 0.")
+    lines.append("- The tool output must be valid JSON conforming to the "
+                 "standard `{source, query, total_results, items}` envelope.")
+    lines.append("")
+
+    lines.append("## Actual Behavior")
+    lines.append("")
+    lines.append(f"```\n{error_text}\n```")
+    lines.append(f"- Duration: {case.get('duration_sec', '?')}s")
+    lines.append("")
+
+    if tool_cmd:
+        lines.append("## Steps to Reproduce")
         lines.append("")
-        for f in failures:
-            lines.append(f"- **{f['name']}**: {f.get('error', 'unknown error')} "
-                         f"({f.get('duration_sec', '?')}s)")
+        lines.append(f"```bash\n{tool_cmd}\n```")
         lines.append("")
 
-    lines.append("### All Results")
+    lines.append("## Benchmark Context")
     lines.append("")
-    lines.append("| Case | Status | Duration | Error |")
-    lines.append("|------|--------|----------|-------|")
-    for r in report["results"]:
-        icon = {"PASS": "✅", "FAIL": "❌", "SKIP": "⏭️"}.get(r["status"], "?")
-        err = r.get("error", "")
-        lines.append(f"| {r['name']} | {icon} {r['status']} | {r.get('duration_sec', '-')}s | {err} |")
+    passed = report.get("passed", 0)
+    failed = report.get("failed", 0)
+    warned = report.get("warned", 0)
+    skipped = report.get("skipped", 0)
+    lines.append(f"| Passed | Failed | Warned | Skipped |")
+    lines.append(f"|--------|--------|--------|---------|")
+    lines.append(f"| {passed} | {failed} | {warned} | {skipped} |")
+    lines.append("")
 
-    lines.append("")
     lines.append("---")
-    lines.append("*Auto-generated by `scripts/orchestrator.py benchmark`*")
+    lines.append("*Auto-generated by `orchestrate/orchestrator.py benchmark`*")
     return "\n".join(lines)
 
 
-def _build_issue_title(report: dict) -> str:
-    failed = report["failed"]
-    date_str = report.get("timestamp", "")[:10]
-    names = [r["name"] for r in report["results"] if r["status"] == "FAIL"]
-    summary = ", ".join(names[:3])
-    if len(names) > 3:
-        summary += f" +{len(names) - 3} more"
-    return f"[Benchmark] {failed} test(s) failed: {summary} ({date_str})"
+def _load_benchmark_cases() -> list[dict]:
+    cases_path = PROJECT_ROOT / "benchmarks" / "benchmark_cases.yaml"
+    if not cases_path.exists():
+        return []
+    import yaml
+    with open(cases_path) as f:
+        data = yaml.safe_load(f)
+    return data.get("cases", [])
 
 
-def _find_duplicate_issue(title_prefix: str) -> int | None:
-    """Check if an open issue with a similar title already exists."""
+def _find_duplicate_issue(case_name: str) -> int | None:
+    """Check if an open issue already covers this specific case."""
     result = _run(
         ["gh", "issue", "list", "--label", ISSUE_LABEL,
          "--state", "open", "--json", "number,title", "--limit", "50"],
@@ -163,7 +235,7 @@ def _find_duplicate_issue(title_prefix: str) -> int | None:
     except json.JSONDecodeError:
         return None
     for iss in issues:
-        if iss.get("title", "").startswith(title_prefix):
+        if case_name in iss.get("title", ""):
             return iss["number"]
     return None
 
@@ -173,7 +245,7 @@ def _find_duplicate_issue(title_prefix: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 def cmd_benchmark() -> dict:
-    """Run the benchmark suite and create a GitHub issue if any test fails."""
+    """Run benchmarks; pick the most critical failure and create a focused GitHub issue."""
     logger.info("=== Running benchmarks ===")
 
     result = subprocess.run(
@@ -195,24 +267,34 @@ def cmd_benchmark() -> dict:
 
     passed = report.get("passed", 0)
     failed = report.get("failed", 0)
+    warned = report.get("warned", 0)
     skipped = report.get("skipped", 0)
-    logger.info("Results: %d passed, %d failed, %d skipped", passed, failed, skipped)
+    logger.info("Results: %d passed, %d failed, %d warned, %d skipped",
+                passed, failed, warned, skipped)
 
-    if failed == 0:
-        logger.info("All benchmarks passed. No issue needed.")
+    worst = _pick_most_critical(report)
+    if worst is None:
+        logger.info("All benchmarks passed — no issue needed.")
         return report
+
+    logger.info("Most critical issue: %s (%s)", worst["name"], worst["status"])
 
     if not _gh_available():
-        logger.warning("gh CLI not available or not authenticated — skipping issue creation")
+        logger.warning("gh CLI not available — skipping issue creation")
         return report
 
-    title = _build_issue_title(report)
-    dup = _find_duplicate_issue("[Benchmark]")
+    _ensure_labels_exist()
+
+    dup = _find_duplicate_issue(worst["name"])
     if dup:
-        logger.info("Open issue #%d already exists with [Benchmark] prefix — skipping creation", dup)
+        logger.info("Open issue #%d already covers '%s' — skipping creation",
+                     dup, worst["name"])
         return report
 
-    body = _format_issue_body(report)
+    date_str = report.get("timestamp", "")[:10]
+    title = _build_issue_title(worst, date_str)
+    body = _build_issue_body(worst, report)
+
     try:
         _run([
             "gh", "issue", "create",
@@ -412,10 +494,21 @@ def cmd_fix() -> None:
 
 def cmd_loop() -> None:
     """Full cycle: run benchmarks then fix open issues."""
+    import time
+
     logger.info("========== Orchestrator loop started ==========")
     start = datetime.now(timezone.utc)
 
-    cmd_benchmark()
+    report = cmd_benchmark()
+
+    has_actionable = any(
+        r["status"] in ("FAIL", "WARN")
+        for r in report.get("results", [])
+    )
+    if has_actionable:
+        logger.info("Waiting for GitHub API to index the new issue …")
+        time.sleep(5)
+
     cmd_fix()
 
     elapsed = (datetime.now(timezone.utc) - start).total_seconds()

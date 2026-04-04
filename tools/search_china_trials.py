@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from utils.http_client import fetch_text
+from utils.http_client import fetch_text, fetch_text_auto
 from utils.parsers import parse_html, extract_text, safe_json_output
 from utils.cache import cache_key, get as cache_get, put as cache_put
 
@@ -30,20 +30,74 @@ RATE_KEY = "china_trials"
 # ---------------------------------------------------------------------------
 
 async def _search_cde(query: str, max_results: int) -> list[dict]:
-    """Search CDE's public information disclosure pages.
+    """Search CDE drug information via the NMPA public data search API.
 
-    CDE uses server-side rendered pages with an internal search API.
-    We hit the full-text search endpoint and parse the HTML results.
+    The CDE main site (cde.org.cn) has very aggressive anti-bot protection.
+    We use the NMPA datasearch API as the primary source, which is more accessible.
     """
-    url = "https://www.cde.org.cn/main/xxgk/listpage/9f9c74c73e0f8f56a8bfbc646055026d"
     items: list[dict] = []
+    api_url = "https://www.nmpa.gov.cn/datasearch/search-result.html"
+
+    # Try NMPA API first
     try:
-        html = await fetch_text(url, rate_key=RATE_KEY, rate_limit=2.0, timeout=20)
-        soup = parse_html(html)
-        for a_tag in soup.select("a[href]")[:max_results]:
-            title = extract_text(a_tag)
-            href = a_tag.get("href", "")
-            if title and href:
+        import httpx
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.nmpa.gov.cn/datasearch/home-index.html",
+        }
+
+        search_api = "https://www.nmpa.gov.cn/datasearch/search-info.html"
+        params = {
+            "nmpa": "yp",
+            "paramDbId": "",
+            "paramStr": query,
+            "paramPageNum": "1",
+            "paramPageSize": str(max_results),
+        }
+
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(search_api, params=params, headers=headers)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    result_list = data.get("list", [])
+                    for item in result_list[:max_results]:
+                        title = item.get("COLUMN2", item.get("column2", ""))
+                        detail_id = item.get("ID", item.get("id", ""))
+                        if title:  # Only add items with actual content
+                            items.append({
+                                "title": title,
+                                "url": f"https://www.nmpa.gov.cn/datasearch/search-info.html?id={detail_id}",
+                                "content": str(item),
+                                "published_at": item.get("COLUMN5", ""),
+                                "metadata": {"registry": "CDE/NMPA"},
+                            })
+                except Exception:
+                    pass
+
+    except Exception as exc:
+        # NMPA API failed, will try fallback below
+        pass
+
+    # Fallback: try CDE website directly if NMPA returned no results
+    if not items:
+        try:
+            html = await fetch_text(
+                "https://www.cde.org.cn/",
+                rate_key=RATE_KEY, rate_limit=2.0, timeout=10,
+            )
+            soup = parse_html(html)
+            q_lower = query.lower()
+            for a_tag in soup.select("a[href]"):
+                title = extract_text(a_tag)
+                href = a_tag.get("href", "")
+                if not title or not href or len(title) < 6:
+                    continue
+                if q_lower and q_lower not in title.lower():
+                    continue
                 full_url = href if href.startswith("http") else f"https://www.cde.org.cn{href}"
                 items.append({
                     "title": title,
@@ -52,14 +106,18 @@ async def _search_cde(query: str, max_results: int) -> list[dict]:
                     "published_at": "",
                     "metadata": {"registry": "CDE"},
                 })
-    except Exception as exc:
-        items.append({
-            "title": f"[CDE search error: {exc}]",
-            "url": url,
-            "content": str(exc),
-            "published_at": "",
-            "metadata": {"registry": "CDE", "error": True},
-        })
+                if len(items) >= max_results:
+                    break
+        except Exception as exc:
+            # Both NMPA and CDE failed
+            items.append({
+                "title": f"[CDE search error: {exc}]",
+                "url": api_url,
+                "content": str(exc),
+                "published_at": "",
+                "metadata": {"registry": "CDE", "error": True},
+            })
+
     return items
 
 
@@ -139,49 +197,67 @@ async def _search_chinadrugtrials(query: str, max_results: int) -> list[dict]:
 async def _search_chictr(query: str, max_results: int) -> list[dict]:
     """Search ChiCTR (Chinese Clinical Trial Registry).
 
-    The site provides a search page at searchproj.html.
+    ChiCTR uses Aliyun WAF anti-bot. We use Playwright to fill the search form
+    and parse the result table.
     """
     items: list[dict] = []
+    search_url = "https://www.chictr.org.cn/searchproj.html"
     try:
-        import httpx
+        from playwright.async_api import async_playwright
 
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
-            resp = await client.get(
-                "https://www.chictr.org.cn/searchproj.html",
-                params={"title": query, "officialname": "", "subjectid": ""},
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-                },
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            ctx = await browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                locale="zh-CN",
             )
-            resp.raise_for_status()
-            html = resp.text
+            page = await ctx.new_page()
+            await page.goto(search_url, wait_until="load", timeout=30000)
+            await page.wait_for_timeout(2000)
+
+            await page.fill("#topic", query)
+            await page.press("#topic", "Enter")
+            await page.wait_for_timeout(5000)
+
+            html = await page.content()
+            await browser.close()
 
         soup = parse_html(html)
-        result_items = soup.select("div.result-item, table.table tr, div.searchResult li")
-
-        for el in result_items[:max_results]:
-            link = el.find("a")
-            if not link:
+        rows = soup.select("table tr")
+        for row in rows[1:]:
+            cells = row.select("td")
+            if len(cells) < 4:
                 continue
-            title = extract_text(link)
-            href = link.get("href", "")
-            if href and not href.startswith("http"):
-                href = f"https://www.chictr.org.cn/{href}"
+            reg_link = cells[1].find("a") if len(cells) > 1 else None
+            title_link = cells[2].find("a") if len(cells) > 2 else None
 
-            date_el = el.find(class_=re.compile(r"date|time"))
-            date_str = extract_text(date_el) if date_el else ""
+            reg_no = extract_text(cells[1])
+            title = extract_text(cells[2])
+            study_type = extract_text(cells[3]) if len(cells) > 3 else ""
+            date_str = extract_text(cells[4]) if len(cells) > 4 else ""
+
+            href = ""
+            link = title_link or reg_link
+            if link:
+                href = link.get("href", "")
+                if href and not href.startswith("http"):
+                    href = f"https://www.chictr.org.cn/{href}"
 
             items.append({
-                "title": title,
+                "title": title or reg_no,
                 "url": href,
-                "content": extract_text(el),
+                "content": f"Registration: {reg_no}. Type: {study_type}.",
                 "published_at": date_str,
-                "metadata": {"registry": "ChiCTR"},
+                "metadata": {"registry": "ChiCTR", "registration_no": reg_no},
             })
+            if len(items) >= max_results:
+                break
+
     except Exception as exc:
         items.append({
             "title": f"[ChiCTR search error: {exc}]",
-            "url": "https://www.chictr.org.cn/searchproj.html",
+            "url": search_url,
             "content": str(exc),
             "published_at": "",
             "metadata": {"registry": "ChiCTR", "error": True},

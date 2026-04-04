@@ -18,7 +18,7 @@ from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from utils.http_client import fetch_text
+from utils.http_client import fetch_text, fetch_text_auto
 from utils.parsers import parse_html, extract_text, safe_json_output
 from utils.cache import cache_key, get as cache_get, put as cache_put
 
@@ -75,18 +75,28 @@ async def _search_aacr(query: str, max_results: int) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 async def _search_asco(query: str, max_results: int) -> list[dict]:
-    """Search ASCO abstracts."""
+    """Search ASCO abstracts.
+
+    Primary: try ascopubs.org. Fallback: PubMed search restricted to JCO
+    (Journal of Clinical Oncology) where ASCO meeting abstracts are published.
+    """
     items: list[dict] = []
+
     url = f"https://ascopubs.org/action/doSearch?text1={quote(query)}&startPage=0&pageSize={max_results}"
     try:
-        html = await fetch_text(url, rate_key=RATE_KEY, rate_limit=2.0, timeout=20)
+        html = await fetch_text(url, rate_key=RATE_KEY, rate_limit=2.0, timeout=15, max_retries=1)
         soup = parse_html(html)
 
-        for article in soup.select("div.searchResultItem, article.item, div.issue-item")[:max_results]:
+        for article in soup.select(
+            "div.searchResultItem, article.item, div.issue-item, "
+            "div.search-result, li.search-result-item"
+        )[:max_results]:
             link = article.find("a", class_="ref nowrap") or article.find("a")
             if not link:
                 continue
             title = extract_text(link)
+            if not title or len(title) < 5:
+                continue
             href = link.get("href", "")
             if href and not href.startswith("http"):
                 href = f"https://ascopubs.org{href}"
@@ -104,10 +114,58 @@ async def _search_asco(query: str, max_results: int) -> list[dict]:
                 "published_at": date_str,
                 "metadata": {"conference": "ASCO"},
             })
+    except Exception:
+        pass
+
+    if not items:
+        items = await _search_asco_via_pubmed(query, max_results)
+
+    return items
+
+
+async def _search_asco_via_pubmed(query: str, max_results: int) -> list[dict]:
+    """Fallback: search PubMed for ASCO abstracts published in JCO."""
+    from utils.http_client import fetch_json
+    items: list[dict] = []
+    try:
+        pubmed_query = f"{query} AND (\"J Clin Oncol\"[Journal] OR \"ASCO\"[All Fields])"
+        search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        search_data = await fetch_json(
+            search_url,
+            params={"db": "pubmed", "term": pubmed_query, "retmax": str(max_results),
+                    "retmode": "json", "sort": "pub_date"},
+            rate_key="pubmed", rate_limit=3.0,
+        )
+        id_list = search_data.get("esearchresult", {}).get("idlist", [])
+        if not id_list:
+            return items
+
+        summary_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+        summary_data = await fetch_json(
+            summary_url,
+            params={"db": "pubmed", "id": ",".join(id_list), "retmode": "json"},
+            rate_key="pubmed", rate_limit=3.0,
+        )
+        results = summary_data.get("result", {})
+        for pmid in id_list:
+            article = results.get(pmid, {})
+            if not article or pmid == "uids":
+                continue
+            title = article.get("title", "")
+            authors = ", ".join(a.get("name", "") for a in article.get("authors", [])[:3])
+            pub_date = article.get("pubdate", "")
+            source = article.get("source", "")
+            items.append({
+                "title": title,
+                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                "content": f"Authors: {authors}. Source: {source}".strip(),
+                "published_at": pub_date,
+                "metadata": {"conference": "ASCO", "via": "PubMed", "pmid": pmid},
+            })
     except Exception as exc:
         items.append({
             "title": f"[ASCO search error: {exc}]",
-            "url": url,
+            "url": "https://ascopubs.org/",
             "content": str(exc),
             "published_at": "",
             "metadata": {"conference": "ASCO", "error": True},
