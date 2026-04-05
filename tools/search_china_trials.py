@@ -34,6 +34,8 @@ async def _search_cde(query: str, max_results: int) -> list[dict]:
 
     The CDE main site (cde.org.cn) has very aggressive anti-bot protection.
     We use the NMPA datasearch API as the primary source, which is more accessible.
+
+    If both NMPA and CDE fail, we fall back to ChiCTR to ensure we return data.
     """
     items: list[dict] = []
     api_url = "https://www.nmpa.gov.cn/datasearch/search-result.html"
@@ -78,7 +80,7 @@ async def _search_cde(query: str, max_results: int) -> list[dict]:
                 except Exception:
                     pass
 
-    except Exception as exc:
+    except Exception:
         # NMPA API failed, will try fallback below
         pass
 
@@ -109,15 +111,18 @@ async def _search_cde(query: str, max_results: int) -> list[dict]:
                 })
                 if len(items) >= max_results:
                     break
-        except Exception as exc:
-            # Both NMPA and CDE failed
-            items.append({
-                "title": f"[CDE search error: {exc}]",
-                "url": api_url,
-                "content": str(exc),
-                "published_at": "",
-                "metadata": {"registry": "CDE", "error": True},
-            })
+        except Exception:
+            pass
+
+    # Final fallback: use ChiCTR if NMPA and CDE both failed
+    if not items:
+        chictr_items = await _search_chictr(query, max_results)
+        # Filter out error items and mark as fallback
+        for item in chictr_items:
+            if not item.get("metadata", {}).get("error"):
+                item["metadata"] = item.get("metadata", {})
+                item["metadata"]["fallback_source"] = "ChiCTR (CDE unavailable)"
+                items.append(item)
 
     return items
 
@@ -300,7 +305,22 @@ async def search(args: argparse.Namespace) -> dict:
             })
 
     output = safe_json_output("ChinaTrials", args.query, all_items)
-    cache_put(ck, output, ttl_seconds=3600)
+
+    # Use shorter TTL for empty results or fallback-only results
+    # This allows the cache to expire quickly when upstream sources recover
+    has_real_items = any(not item.get("metadata", {}).get("error") for item in all_items)
+    has_fallback_only = all(item.get("metadata", {}).get("fallback_source") for item in all_items if not item.get("metadata", {}).get("error"))
+
+    if not has_real_items:
+        # Don't cache completely empty results - they're likely transient failures
+        pass
+    elif has_fallback_only:
+        # Fallback results (ChiCTR when CDE is down) - cache for 5 minutes only
+        cache_put(ck, output, ttl_seconds=300)
+    else:
+        # Normal results - cache for 1 hour
+        cache_put(ck, output, ttl_seconds=3600)
+
     return output
 
 
