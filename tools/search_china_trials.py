@@ -85,7 +85,8 @@ async def _search_cde(query: str, max_results: int) -> list[dict]:
     # Fallback: try CDE website directly if NMPA returned no results
     if not items:
         try:
-            html = await fetch_text(
+            # Use fetch_text_auto which falls back to Playwright for anti-bot pages
+            html = await fetch_text_auto(
                 "https://www.cde.org.cn/",
                 rate_key=RATE_KEY, rate_limit=2.0, timeout=10,
             )

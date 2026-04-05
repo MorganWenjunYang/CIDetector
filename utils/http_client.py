@@ -168,6 +168,12 @@ def _looks_like_antibot(html: str) -> bool:
         "document.location.reload()",
         "_cf_chl_opt",
         "challenge-platform",
+        # CDE/NMPA specific anti-bot patterns
+        "9DhefwqGPrzGxEp9hPaoag",
+        "_$ts.nsd=",
+        "function _$",
+        "r='m'",
+        "<script type='text/javascript' r='m'>",
     ]
     head = html[:3000].lower()
     return any(m.lower() in head for m in markers)

@@ -133,9 +133,13 @@ def main() -> None:
         help="Path to benchmark cases YAML (default: benchmarks/benchmark_cases.yaml)",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Print progress to stderr")
+    parser.add_argument("--filter", "-f", default=None,
+                        help="Only run cases whose name contains this string")
     args = parser.parse_args()
 
     cases = load_cases(Path(args.cases))
+    if args.filter:
+        cases = [c for c in cases if args.filter.lower() in c["name"].lower()]
     if not cases:
         print(json.dumps({"error": "no benchmark cases found"}))
         sys.exit(1)
