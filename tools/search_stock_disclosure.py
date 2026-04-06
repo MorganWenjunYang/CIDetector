@@ -91,60 +91,108 @@ RATE_KEY = "stock_disclosure"
 
 SSE_SEARCH_API = "https://query.sse.com.cn/search/getSearchResult.do"
 
-async def _search_sse(query: str, max_results: int) -> list[dict]:
-    """Search SSE via its internal search API.
+# East Money stock search API (working alternative)
+EASTMONEY_SEARCH_API = "http://searchapi.eastmoney.com/api/suggest/get"
+EASTMONEY_STOCK_INFO_API = "http://push2.eastmoney.com/api/qt/stock/get"
 
-    SSE's search page (www.sse.com.cn/home/search/) loads results via XHR.
-    The API requires a Referer header to work.
+async def _search_sse(query: str, max_results: int) -> list[dict]:
+    """Search SSE via East Money APIs (SSE's own API is currently broken).
+
+    Strategy:
+    1. Use East Money stock search to find stock codes for queried companies
+    2. Use East Money stock info API to get basic company data
+    3. Return working URLs to East Money quote page and CNINFO search
     """
     items: list[dict] = []
     try:
         import httpx
 
-        headers = {
-            "Referer": "https://www.sse.com.cn/",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-        }
-        params = {
-            "isPagination": "true",
-            "pageHelp.pageSize": str(max_results),
-            "pageHelp.pageNo": "1",
-            "keyword": query,
-            "search": "qwjs",
-            "searchType": "1",  # announcements
-        }
+        # Step 1: Search for stock code using East Money
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            resp = await client.get(
-                "https://query.sse.com.cn/commonSo498Query.do",
-                params=params,
-                headers=headers,
+            # East Money stock search API
+            search_resp = await client.get(
+                EASTMONEY_SEARCH_API,
+                params={
+                    "input": query,
+                    "type": "14",  # stock type
+                    "cb": "jsonpCallback",
+                },
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                    "Referer": "http://quote.eastmoney.com/",
+                },
             )
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except Exception:
-                    data = {}
 
-                for item in (data.get("result", []) or [])[:max_results]:
-                    title = item.get("doctitle", "") or item.get("TITLE", "")
-                    url = item.get("docurl", "") or item.get("URL", "")
-                    date = item.get("createTime", "") or item.get("CDATE", "")
-                    items.append({
-                        "title": re.sub(r"<[^>]+>", "", title),
-                        "url": url if url.startswith("http") else f"https://www.sse.com.cn{url}",
-                        "content": "",
-                        "published_at": date,
-                        "metadata": {"exchange": "SSE"},
-                    })
+            stock_code = None
+            stock_name = None
+
+            if search_resp.status_code == 200:
+                # Parse JSONP response
+                text = search_resp.text
+                if "jsonpCallback(" in text:
+                    try:
+                        # Extract JSON from JSONP
+                        json_str = text[text.index("(") + 1 : text.rindex(")")].strip()
+                        import json
+                        data = json.loads(json_str)
+                        if data.get("QuotationCodeTable", {}).get("Data"):
+                            stock_info = data["QuotationCodeTable"]["Data"][0]
+                            stock_code = stock_info.get("Code", "")
+                            stock_name = stock_info.get("Name", "")
+                    except Exception:
+                        pass
+
+            # Step 2: If we found a stock code, get more info and create result
+            if stock_code and stock_name:
+                # Get additional stock info
+                info_resp = await client.get(
+                    EASTMONEY_STOCK_INFO_API,
+                    params={
+                        "cb": "jsonpCallback",
+                        "secid": f"1.{stock_code}",  # SSE stocks use market code 1
+                        "fields": "f57,f58,f43,f44,f45,f162",
+                    },
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                    },
+                )
+
+                items.append({
+                    "title": f"{stock_name} ({stock_code})",
+                    "url": f"http://quote.eastmoney.com/sh{stock_code}.html",
+                    "content": f"SSE科创板上市公司: {stock_name} (股票代码: {stock_code})",
+                    "published_at": "",
+                    "metadata": {
+                        "exchange": "SSE",
+                        "stock_code": stock_code,
+                        "stock_name": stock_name,
+                        "source": "East Money",
+                    },
+                })
+
+                # Add CNINFO disclosure link
+                items.append({
+                    "title": f"{stock_name} 公告查询 (巨潮资讯)",
+                    "url": f"http://www.cninfo.com.cn/new/fulltextSearch/fulltextSearch.do?searchkey={quote(stock_name)}&column=sse",
+                    "content": f"巨潮资讯网公告查询链接 - {stock_name}",
+                    "published_at": "",
+                    "metadata": {
+                        "exchange": "SSE",
+                        "stock_code": stock_code,
+                        "source": "CNINFO",
+                    },
+                })
+
     except Exception:
         pass
 
     if not items:
-        search_url = f"https://www.sse.com.cn/home/search/index.shtml?webswd={quote(query)}"
+        # Fallback to manual search URL
+        search_url = f"http://www.cninfo.com.cn/new/fulltextSearch/index?searchkey={quote(query)}&type=sh"
         items.append({
-            "title": f"SSE search for: {query}",
+            "title": f"SSE disclosure search for: {query}",
             "url": search_url,
-            "content": "Direct API returned no results. Use the URL above for manual search or use fetch_page.py to scrape it.",
+            "content": "SSE API unavailable. Use CNINFO (巨潮资讯) for SSE stock disclosures.",
             "published_at": "",
             "metadata": {"exchange": "SSE", "fallback": True},
         })
@@ -184,17 +232,28 @@ async def _search_hkex(query: str, max_results: int) -> list[dict]:
     # Check if query matches a known 18A stock code
     code_match = re.match(r'^(0?\d{4,5})$', query.strip())
     company_name = None
+    stock_code = None
     search_query = query
 
     if code_match:
         code = code_match.group(1).zfill(5)  # Normalize to 5 digits
         if code in HKEX_18A_CODES:
             company_name = HKEX_18A_CODES[code]
+            stock_code = code
             # Use both code and name for search
             search_query = code
+    else:
+        # Reverse lookup: search by company name in known 18A codes
+        trad_query = simplify_to_traditional(query)
+        for code, name in HKEX_18A_CODES.items():
+            if query in name or trad_query in name or name in query or name in trad_query:
+                company_name = name
+                stock_code = code
+                search_query = code
+                break
 
     # Convert simplified Chinese to traditional for name searches
-    if not code_match:
+    if not code_match and not stock_code:
         search_query = simplify_to_traditional(query)
 
     try:
