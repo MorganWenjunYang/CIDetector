@@ -1,5 +1,5 @@
 cases:
-  # --- REST API (most stable) ---
+  # --- Trials / registries (mapped from sources.md) ---
   - name: "ClinicalTrials.gov"
     tool: "tools/search_clinical_trials.py"
     args: ["--query", "pembrolizumab", "--max-results", "3"]
@@ -10,16 +10,15 @@ cases:
     args: ["--query", "EGFR inhibitor", "--max-results", "3"]
     requires_env: []
 
-  # --- Tavily API (requires key) ---
-  - name: "WebSearch (Tavily)"
-    tool: "tools/web_search.py"
-    args: ["--query", "ADC oncology 2026", "--max-results", "3"]
-    requires_env: ["TAVILY_API_KEY"]
-
-  # --- HTML scraping (most fragile, breaks on site redesign / anti-bot) ---
   - name: "China Trials (CDE)"
     tool: "tools/search_china_trials.py"
     args: ["--query", "PD-1", "--source", "cde", "--max-results", "3"]
+    requires_env: []
+    fragile: true
+
+  - name: "China Trials (ChinaDrugTrials)"
+    tool: "tools/search_china_trials.py"
+    args: ["--query", "PD-1", "--source", "chinadrugtrials", "--max-results", "3"]
     requires_env: []
     fragile: true
 
@@ -29,10 +28,46 @@ cases:
     requires_env: []
     fragile: true
 
-  - name: "Stock Disclosure (HKEX)"
-    tool: "tools/search_stock_disclosure.py"
-    args: ["--query", "信达生物", "--exchange", "hkex", "--max-results", "3"]
+  # --- Media / web sources (mapped from sources.md via Tavily site search) ---
+  - name: "WebSearch (General)"
+    tool: "tools/web_search.py"
+    args: ["--query", "ADC oncology 2026", "--max-results", "3"]
+    requires_env: ["TAVILY_API_KEY"]
+
+  - name: "WebSearch (Fierce Biotech)"
+    tool: "tools/web_search.py"
+    args: ["--query", "B7H4", "--site", "fiercebiotech.com", "--max-results", "3"]
+    requires_env: ["TAVILY_API_KEY"]
+
+  - name: "WebSearch (Endpoints)"
+    tool: "tools/web_search.py"
+    args: ["--query", "B7H4", "--site", "endpts.com", "--max-results", "3"]
+    requires_env: ["TAVILY_API_KEY"]
+    fragile: true
+
+  - name: "WebSearch (BioCentury)"
+    tool: "tools/web_search.py"
+    args: ["--query", "ADC", "--site", "biocentury.com", "--max-results", "3"]
+    requires_env: ["TAVILY_API_KEY"]
+    fragile: true
+
+  - name: "WebSearch (Pharmcube)"
+    tool: "tools/web_search.py"
+    args: ["--query", "百利天恒", "--site", "pharmcube.com", "--max-results", "3"]
+    requires_env: ["TAVILY_API_KEY"]
+    fragile: true
+
+  - name: "WebSearch (PRNewswire)"
+    tool: "tools/web_search.py"
+    args: ["--query", "oncology", "--site", "prnewswire.com", "--max-results", "3"]
+    requires_env: ["TAVILY_API_KEY"]
+
+  # --- Conferences (mapped from sources.md) ---
+  - name: "Conferences (AACR)"
+    tool: "tools/search_conferences.py"
+    args: ["--query", "pembrolizumab", "--conference", "aacr", "--max-results", "3"]
     requires_env: []
+    fragile: true
 
   - name: "Conferences (ASCO)"
     tool: "tools/search_conferences.py"
@@ -40,10 +75,32 @@ cases:
     requires_env: []
     fragile: true
 
+  - name: "Conferences (ESMO)"
+    tool: "tools/search_conferences.py"
+    args: ["--query", "pembrolizumab", "--conference", "esmo", "--max-results", "3"]
+    requires_env: []
+    fragile: true
+
+  # --- Capital markets / disclosures (mapped from sources.md) ---
+  - name: "Stock Disclosure (SSE)"
+    tool: "tools/search_stock_disclosure.py"
+    args: ["--query", "百利天恒", "--exchange", "sse", "--max-results", "3"]
+    requires_env: []
+
+  - name: "Stock Disclosure (HKEX)"
+    tool: "tools/search_stock_disclosure.py"
+    args: ["--query", "信达生物", "--exchange", "hkex", "--max-results", "3"]
+    requires_env: []
+
   # --- RSS ---
   - name: "RSS Monitor"
     tool: "tools/rss_monitor.py"
     args: ["--keyword", "", "--feeds", "fierce"]
+    requires_env: []
+
+  - name: "RSS Monitor (PRNewswire)"
+    tool: "tools/rss_monitor.py"
+    args: ["--keyword", "oncology", "--feeds", "prn"]
     requires_env: []
 
   # --- Page fetch (different output structure) ---
