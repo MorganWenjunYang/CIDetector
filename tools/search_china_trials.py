@@ -38,6 +38,7 @@ async def _search_cde(query: str, max_results: int) -> list[dict]:
     Fallback chain: NMPA API -> CDE website -> ChinaDrugTrials -> ChiCTR -> ClinicalTrials.gov (China)
     """
     items: list[dict] = []
+    primary_failures: list[str] = []
 
     # Try NMPA API first
     try:
@@ -74,14 +75,14 @@ async def _search_cde(query: str, max_results: int) -> list[dict]:
                                 "url": f"https://www.nmpa.gov.cn/datasearch/search-info.html?id={detail_id}",
                                 "content": str(item),
                                 "published_at": item.get("COLUMN5", ""),
-                                "metadata": {"registry": "CDE/NMPA"},
+                                "metadata": {"registry": "CDE/NMPA", "requested_registry": "CDE"},
                             })
-                except Exception:
-                    pass
+                except Exception as exc:
+                    primary_failures.append(f"nmpa_parse_error:{str(exc)[:120]}")
 
-    except Exception:
+    except Exception as exc:
         # NMPA API failed, will try fallback below
-        pass
+        primary_failures.append(f"nmpa_api_error:{str(exc)[:120]}")
 
     # Fallback 1: try CDE website directly if NMPA returned no results
     if not items:
@@ -106,12 +107,12 @@ async def _search_cde(query: str, max_results: int) -> list[dict]:
                     "url": full_url,
                     "content": "",
                     "published_at": "",
-                    "metadata": {"registry": "CDE"},
+                    "metadata": {"registry": "CDE", "requested_registry": "CDE"},
                 })
                 if len(items) >= max_results:
                     break
-        except Exception:
-            pass
+        except Exception as exc:
+            primary_failures.append(f"cde_site_error:{str(exc)[:120]}")
 
     # Fallback 2: try ChinaDrugTrials if NMPA and CDE both failed
     if not items:
@@ -120,6 +121,10 @@ async def _search_cde(query: str, max_results: int) -> list[dict]:
             if not item.get("metadata", {}).get("error"):
                 item["metadata"] = item.get("metadata", {})
                 item["metadata"]["fallback_source"] = "ChinaDrugTrials (CDE unavailable)"
+                item["metadata"]["requested_registry"] = "CDE"
+                item["metadata"]["primary_source_failed"] = True
+                if primary_failures:
+                    item["metadata"]["primary_source_errors"] = primary_failures[:3]
                 items.append(item)
 
     # Fallback 3: use ChiCTR if all else failed
@@ -130,6 +135,10 @@ async def _search_cde(query: str, max_results: int) -> list[dict]:
             if not item.get("metadata", {}).get("error"):
                 item["metadata"] = item.get("metadata", {})
                 item["metadata"]["fallback_source"] = "ChiCTR (CDE unavailable)"
+                item["metadata"]["requested_registry"] = "CDE"
+                item["metadata"]["primary_source_failed"] = True
+                if primary_failures:
+                    item["metadata"]["primary_source_errors"] = primary_failures[:3]
                 items.append(item)
 
     # Fallback 4: ClinicalTrials.gov with China location filter
@@ -140,6 +149,10 @@ async def _search_cde(query: str, max_results: int) -> list[dict]:
             if not item.get("metadata", {}).get("error"):
                 item["metadata"] = item.get("metadata", {})
                 item["metadata"]["fallback_source"] = "ClinicalTrials.gov (China locations)"
+                item["metadata"]["requested_registry"] = "CDE"
+                item["metadata"]["primary_source_failed"] = True
+                if primary_failures:
+                    item["metadata"]["primary_source_errors"] = primary_failures[:3]
                 items.append(item)
 
     return items
@@ -432,17 +445,25 @@ async def search(args: argparse.Namespace) -> dict:
                 "metadata": {"error": True},
             })
 
+    requested_registry = source.upper()
+    for item in all_items:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.setdefault("metadata", {})
+        metadata.setdefault("requested_registry", requested_registry)
+
     output = safe_json_output("ChinaTrials", args.query, all_items)
 
     # Use shorter TTL for empty results or fallback-only results
     # This allows the cache to expire quickly when upstream sources recover
     has_real_items = any(not item.get("metadata", {}).get("error") for item in all_items)
+    has_error_items = any(item.get("metadata", {}).get("error") for item in all_items)
     has_fallback_only = all(item.get("metadata", {}).get("fallback_source") for item in all_items if not item.get("metadata", {}).get("error"))
 
     if not has_real_items:
         # Don't cache completely empty results - they're likely transient failures
         pass
-    elif has_fallback_only:
+    elif has_error_items or has_fallback_only:
         # Fallback results (ChiCTR when CDE is down) - cache for 5 minutes only
         cache_put(ck, output, ttl_seconds=300)
     else:

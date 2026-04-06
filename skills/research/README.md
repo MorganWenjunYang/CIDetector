@@ -143,7 +143,7 @@ python3 skills/research.py --query "CLDN18.2 中国 vs 全球管线对比"
 # 创建关键事实声明文件
 cat > claims.json << 'EOF'
 {
-  "key_claims": [
+  "claims": [
     "Farxiga 2024 年销售额 77 亿美元",
     "Tagrisso 2024 年销售额 65.8 亿美元"
   ]

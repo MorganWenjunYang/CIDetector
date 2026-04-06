@@ -81,6 +81,7 @@ async def _search_asco(query: str, max_results: int) -> list[dict]:
     (Journal of Clinical Oncology) where ASCO meeting abstracts are published.
     """
     items: list[dict] = []
+    primary_error: str | None = None
 
     url = f"https://ascopubs.org/action/doSearch?text1={quote(query)}&startPage=0&pageSize={max_results}"
     try:
@@ -114,11 +115,20 @@ async def _search_asco(query: str, max_results: int) -> list[dict]:
                 "published_at": date_str,
                 "metadata": {"conference": "ASCO"},
             })
-    except Exception:
-        pass
+    except Exception as exc:
+        primary_error = str(exc)
 
     if not items:
         items = await _search_asco_via_pubmed(query, max_results)
+        if primary_error:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                metadata = item.setdefault("metadata", {})
+                if metadata.get("error"):
+                    continue
+                metadata["primary_source_failed"] = True
+                metadata["primary_source_error"] = primary_error[:240]
 
     return items
 
@@ -248,8 +258,37 @@ async def search(args: argparse.Namespace) -> dict:
                 "metadata": {"error": True},
             })
 
+    requested_conference = conf.upper()
+    for item in all_items:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.setdefault("metadata", {})
+        metadata.setdefault("requested_conference", requested_conference)
+
     output = safe_json_output("Conferences", args.query, all_items)
-    cache_put(ck, output, ttl_seconds=3600)
+
+    real_items = [
+        item for item in all_items
+        if isinstance(item, dict) and not (item.get("metadata") or {}).get("error")
+    ]
+    has_error_items = any(
+        isinstance(item, dict) and (item.get("metadata") or {}).get("error")
+        for item in all_items
+    )
+    has_fallback_items = any(
+        isinstance(item, dict) and (
+            (item.get("metadata") or {}).get("via")
+            or (item.get("metadata") or {}).get("primary_source_failed")
+        )
+        for item in real_items
+    )
+
+    if not real_items:
+        pass
+    elif has_error_items or has_fallback_items:
+        cache_put(ck, output, ttl_seconds=300)
+    else:
+        cache_put(ck, output, ttl_seconds=3600)
     return output
 
 

@@ -146,7 +146,11 @@ async def _search_sse(query: str, max_results: int) -> list[dict]:
             "url": search_url,
             "content": "Direct API returned no results. Use the URL above for manual search or use fetch_page.py to scrape it.",
             "published_at": "",
-            "metadata": {"exchange": "SSE", "fallback": True},
+            "metadata": {
+                "exchange": "SSE",
+                "fallback": True,
+                "fallback_reason": "sse_api_no_results",
+            },
         })
     return items
 
@@ -274,7 +278,11 @@ async def _search_hkex(query: str, max_results: int) -> list[dict]:
             "url": f"https://www1.hkexnews.hk/search/titlesearch.xhtml?lang=ZH&query={quote(search_query)}",
             "content": content_msg,
             "published_at": "",
-            "metadata": {"exchange": "HKEX", "fallback": True},
+            "metadata": {
+                "exchange": "HKEX",
+                "fallback": True,
+                "fallback_reason": "hkex_parse_no_results",
+            },
         })
 
         # Add company lookup result if we have it
@@ -284,7 +292,14 @@ async def _search_hkex(query: str, max_results: int) -> list[dict]:
                 "url": f"https://www.hkex.com.hk/Market-Data/Securities-Prices/Equities/Equities-Quote?sym={code_match.group(1)}",
                 "content": f"Known HKEX 18A biotech company: {company_name}",
                 "published_at": "",
-                "metadata": {"exchange": "HKEX", "stock_code": code_match.group(1), "company_name": company_name},
+                "metadata": {
+                    "exchange": "HKEX",
+                    "stock_code": code_match.group(1),
+                    "company_name": company_name,
+                    "fallback": True,
+                    "supplemental_reference": True,
+                    "fallback_reason": "known_company_lookup_reference",
+                },
             })
 
     return items
@@ -321,8 +336,24 @@ async def search(args: argparse.Namespace) -> dict:
                 "metadata": {"error": True},
             })
 
+    requested_exchange = ex.upper()
+    for item in all_items:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.setdefault("metadata", {})
+        metadata.setdefault("requested_exchange", requested_exchange)
+
     output = safe_json_output("StockDisclosure", args.query, all_items)
-    cache_put(ck, output, ttl_seconds=3600)
+    has_real_items = any(not item.get("metadata", {}).get("error") for item in all_items)
+    has_error_items = any(item.get("metadata", {}).get("error") for item in all_items)
+    has_fallback_items = any(item.get("metadata", {}).get("fallback") for item in all_items if not item.get("metadata", {}).get("error"))
+
+    if not has_real_items:
+        pass
+    elif has_error_items or has_fallback_items:
+        cache_put(ck, output, ttl_seconds=300)
+    else:
+        cache_put(ck, output, ttl_seconds=3600)
     return output
 
 

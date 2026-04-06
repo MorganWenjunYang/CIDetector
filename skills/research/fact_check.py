@@ -16,6 +16,8 @@ CIDector Fact-Check Module - 事实核查与多源交叉验证
     1. 解析事实陈述 -> 2. 提取验证关键词 -> 3. 多源搜索验证 -> 4. 一致性评估 -> 5. 生成报告
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import re
@@ -518,6 +520,102 @@ class ReportGenerator:
         return report
 
 
+def load_claims_input(
+    facts: list[str] | None = None,
+    facts_file: str | None = None,
+) -> list[str]:
+    """Load claims from CLI args or a JSON file.
+
+    Supports both `claims` and the legacy `key_claims` keys for compatibility.
+    """
+    if facts:
+        return list(facts)
+    if not facts_file:
+        return []
+
+    with open(facts_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    claims = data.get("claims")
+    if claims is None:
+        claims = data.get("key_claims", [])
+
+    if not isinstance(claims, list):
+        return []
+
+    return [str(claim).strip() for claim in claims if str(claim).strip()]
+
+
+def verify_claims_statements(
+    claims_input: list[str],
+    *,
+    verbose: bool = False,
+) -> list[FactClaim]:
+    """Verify a list of claim statements and return structured results."""
+    engine = VerificationEngine()
+    claims: list[FactClaim] = []
+
+    if verbose:
+        print("开始事实核查...")
+        print("=" * 60)
+
+    for statement in claims_input:
+        if verbose:
+            print(f"\n核查：{statement}")
+
+        category = ClaimClassifier.classify(statement)
+        entities = ClaimClassifier.extract_entities(statement)
+
+        claim = FactClaim(
+            original_statement=statement,
+            category=category,
+            key_entities=entities,
+        )
+
+        if verbose:
+            print(f"  类别：{category}")
+            print(f"  实体：{entities}")
+
+        verified_claim = engine.verify_claim(claim)
+        claims.append(verified_claim)
+
+        if verbose:
+            print(f"  状态：{verified_claim.verification_status}")
+            print(f"  来源数：{len(verified_claim.sources)}")
+
+    if verbose:
+        print("\n" + "=" * 60)
+
+    return claims
+
+
+def serialize_claims(claims: list[FactClaim]) -> list[dict]:
+    """Convert verified claims into JSON-serializable dictionaries."""
+    return [
+        {
+            "statement": c.original_statement,
+            "category": c.category,
+            "status": c.verification_status,
+            "sources": c.sources,
+            "conflicts": c.conflicting_info,
+            "notes": c.notes,
+        }
+        for c in claims
+    ]
+
+
+def summarize_verification_statuses(claims: list[FactClaim]) -> dict:
+    """Return aggregate fact-check status counts."""
+    return {
+        "total": len(claims),
+        "verified": sum(1 for c in claims if c.verification_status == "verified"),
+        "likely_true": sum(1 for c in claims if c.verification_status == "likely_true"),
+        "conflicting": sum(1 for c in claims if c.verification_status == "conflicting"),
+        "unverified": sum(1 for c in claims if c.verification_status == "unverified"),
+        "uncertain": sum(1 for c in claims if c.verification_status == "uncertain"),
+    }
+
+
 # =============================================================================
 # CLI 入口
 # =============================================================================
@@ -548,59 +646,19 @@ def main():
 
     args = parser.parse_args()
 
-    # 获取事实列表
-    claims_input = []
-    if args.facts:
-        claims_input = args.facts
-    elif args.facts_file:
-        with open(args.facts_file, "r", encoding="utf-8") as f:
-            claims_input = json.load(f).get("claims", [])
-    else:
+    claims_input = load_claims_input(args.facts, args.facts_file)
+    if not claims_input:
         parser.print_help()
         sys.exit(1)
 
-    # 分类和验证
-    engine = VerificationEngine()
-    claims = []
-
-    print("开始事实核查...")
-    print("=" * 60)
-
-    for statement in claims_input:
-        print(f"\n核查：{statement}")
-
-        category = ClaimClassifier.classify(statement)
-        entities = ClaimClassifier.extract_entities(statement)
-
-        claim = FactClaim(
-            original_statement=statement,
-            category=category,
-            key_entities=entities,
-        )
-
-        print(f"  类别：{category}")
-        print(f"  实体：{entities}")
-
-        verified_claim = engine.verify_claim(claim)
-        claims.append(verified_claim)
-
-        print(f"  状态：{verified_claim.verification_status}")
-        print(f"  来源数：{len(verified_claim.sources)}")
-
-    print("\n" + "=" * 60)
+    claims = verify_claims_statements(claims_input, verbose=args.format != "json")
 
     # 生成报告
     if args.format == "json":
-        output = json.dumps([
-            {
-                "statement": c.original_statement,
-                "category": c.category,
-                "status": c.verification_status,
-                "sources": c.sources,
-                "conflicts": c.conflicting_info,
-            }
-            for c in claims
-        ], ensure_ascii=False, indent=2)
+        output = json.dumps(serialize_claims(claims), ensure_ascii=False, indent=2)
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(output)
         print(output)
     else:
         report = ReportGenerator.generate_markdown(claims, args.output)

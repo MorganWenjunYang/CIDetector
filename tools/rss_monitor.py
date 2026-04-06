@@ -92,6 +92,7 @@ async def _fetch_feed(key: str, feed_info: dict, keyword: str) -> list[dict]:
 
 async def monitor(args: argparse.Namespace) -> dict:
     feed_keys = [f.strip() for f in args.feeds.split(",")]
+    invalid_feed_keys = [key for key in feed_keys if key and key not in FEEDS]
     tasks = []
     for key in feed_keys:
         if key in FEEDS:
@@ -102,6 +103,23 @@ async def monitor(args: argparse.Namespace) -> dict:
     for r in results:
         if isinstance(r, list):
             all_items.extend(r)
+        elif isinstance(r, Exception):
+            all_items.append({
+                "title": f"[RSS monitor error: {r}]",
+                "url": "",
+                "content": str(r),
+                "published_at": "",
+                "metadata": {"error": True},
+            })
+
+    for key in invalid_feed_keys:
+        all_items.append({
+            "title": f"[Unknown RSS feed: {key}]",
+            "url": "",
+            "content": f"Unknown feed key '{key}'. Valid values: {', '.join(sorted(FEEDS))}.",
+            "published_at": "",
+            "metadata": {"error": True, "invalid_feed": key},
+        })
 
     return safe_json_output("RSS Monitor", args.keyword, all_items)
 
@@ -121,6 +139,10 @@ def main() -> None:
         for key, info in FEEDS.items():
             print(f"  {key:12s}  {info['name']:25s}  {info['url']}")
         return
+
+    selected_keys = [f.strip() for f in args.feeds.split(",") if f.strip()]
+    if not selected_keys:
+        raise SystemExit("--feeds must include at least one feed key")
 
     result = asyncio.run(monitor(args))
     print(json.dumps(result, ensure_ascii=False, indent=2))

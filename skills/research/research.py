@@ -13,12 +13,23 @@ CIDector Research Skill - 生物医药竞争情报研究决策引擎
 
 import argparse
 import json
-import os
 import re
-import subprocess
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from orchestrate.reporting import build_report_payload, extract_claim_candidates
+from orchestrate.runner import execute_search_plan
+from fact_check import (
+    load_claims_input,
+    serialize_claims,
+    summarize_verification_statuses,
+    verify_claims_statements,
+)
 
 
 # =============================================================================
@@ -515,7 +526,7 @@ def main():
     parser.add_argument(
         "--auto-execute",
         action="store_true",
-        help="自动执行工具调用 (需要用户确认)"
+        help="自动执行搜索计划并汇总报告"
     )
     parser.add_argument(
         "--fact-check",
@@ -531,67 +542,92 @@ def main():
 
     engine = ResearchDecisionEngine(args.query)
 
-    if args.format == "json":
-        print(json.dumps(engine.to_json(), ensure_ascii=False, indent=2))
-    else:
-        print(engine.get_plan_summary())
+    if not args.auto_execute:
+        plan_json = engine.to_json()
+        plan_text = engine.get_plan_summary()
+        fact_check_payload = None
 
-    if args.auto_execute:
-        print("\n" + "=" * 60)
-        print("## 执行工具调用")
-        print("=" * 60)
-
-        for step in engine.search_plan:
-            script = TOOLS[step["tool"]].script
-            params = step["params"]
-            params_str = " ".join(f'{k} "{v}"' for k, v in params.items())
-            cmd = f'python {script} --query "{args.query}" {params_str}'
-            print(f"\n# {step['priority']}: {TOOLS[step['tool']].name}")
-            print(cmd)
-
-    # Fact-Check 模式
-    if args.fact_check or args.claims_file:
-        print("\n" + "=" * 60)
-        print("## 事实核查 (Fact-Check)")
-        print("=" * 60)
-
-        claims_to_verify = []
-
-        # 从文件读取 claims
-        if args.claims_file:
-            with open(args.claims_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                claims_to_verify = data.get("key_claims", [])
-                print(f"从 {args.claims_file} 读取 {len(claims_to_verify)} 条事实声明")
-
-        if not claims_to_verify:
-            print("未提供事实声明，使用 --claims-file 指定")
-            print("\n示例 JSON 格式:")
-            print(json.dumps({
-                "key_claims": [
-                    "Farxiga 2024 年销售额 77 亿美元",
-                    "Tagrisso 2024 年销售额 65.8 亿美元",
-                    "Tozorakimab COPD Phase 3 试验阳性",
-                ]
-            }, indent=2, ensure_ascii=False))
-        else:
-            # 调用 fact_check 模块
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            fact_check_script = os.path.join(script_dir, "fact_check.py")
-
-            cmd = [
-                "python3", fact_check_script,
-                "--facts-file", args.claims_file,
-                "--format", args.format,
-            ]
-            if args.output:
-                cmd.extend(["--output", args.output])
-
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                print(result.stdout)
+        if args.fact_check or args.claims_file:
+            claims_to_verify = load_claims_input(facts_file=args.claims_file)
+            if claims_to_verify:
+                verified_claims = verify_claims_statements(claims_to_verify, verbose=False)
+                fact_check_payload = {
+                    "summary": summarize_verification_statuses(verified_claims),
+                    "claims": serialize_claims(verified_claims),
+                }
             else:
-                print(f"Fact-check 失败：{result.stderr}")
+                fact_check_payload = {
+                    "summary": {"total": 0, "verified": 0, "likely_true": 0, "conflicting": 0, "unverified": 0, "uncertain": 0},
+                    "claims": [],
+                    "note": "未提供可验证的 claims；请通过 --claims-file 提供 JSON 文件。",
+                }
+
+        if args.format == "json":
+            payload = {"plan": plan_json}
+            if fact_check_payload is not None:
+                payload["fact_check"] = fact_check_payload
+            output_text = json.dumps(payload, ensure_ascii=False, indent=2)
+        else:
+            output_text = plan_text
+            if fact_check_payload is not None:
+                output_text += "\n\n## Fact-Check\n"
+                if fact_check_payload.get("note"):
+                    output_text += f"\n- {fact_check_payload['note']}\n"
+                else:
+                    summary = fact_check_payload["summary"]
+                    output_text += (
+                        f"\n- 核查总数：{summary['total']}\n"
+                        f"- 已验证：{summary['verified']}\n"
+                        f"- 可能为真：{summary['likely_true']}\n"
+                        f"- 存在冲突：{summary['conflicting']}\n"
+                        f"- 未验证：{summary['unverified']}\n"
+                    )
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(output_text)
+        print(output_text)
+        return
+
+    execution = execute_search_plan(
+        query=args.query,
+        search_plan=engine.search_plan,
+        tools=TOOLS,
+        project_root=PROJECT_ROOT,
+    )
+
+    claims_to_verify = load_claims_input(facts_file=args.claims_file)
+    generated_claims: list[str] = []
+    fact_check_payload = None
+
+    if not claims_to_verify and args.fact_check:
+        generated_claims = extract_claim_candidates(execution["results"])
+        claims_to_verify = generated_claims
+
+    if claims_to_verify:
+        verified_claims = verify_claims_statements(claims_to_verify, verbose=False)
+        fact_check_payload = {
+            "summary": summarize_verification_statuses(verified_claims),
+            "claims": serialize_claims(verified_claims),
+        }
+
+    report_payload = build_report_payload(
+        query=args.query,
+        decision=engine.to_json(),
+        execution=execution,
+        fact_check=fact_check_payload,
+        generated_claims=generated_claims,
+    )
+
+    if args.format == "json":
+        output_text = json.dumps(report_payload, ensure_ascii=False, indent=2)
+    else:
+        output_text = report_payload["markdown_report"]
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(output_text)
+
+    print(output_text)
 
 
 if __name__ == "__main__":

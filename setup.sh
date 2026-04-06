@@ -8,22 +8,28 @@ echo "Plugin directory: $PLUGIN_DIR"
 echo ""
 
 # 1. Python dependencies
-echo "[1/3] Installing Python dependencies..."
+echo "[1/4] Installing Python dependencies..."
 pip3 install -r "$PLUGIN_DIR/requirements.txt" --quiet
 echo "  Done."
 
-# 2. Playwright browser (optional, for fetch_page --dynamic)
+# 2. Playwright browser (recommended for China sources / dynamic pages)
 echo ""
-echo "[2/3] Playwright browser (optional, for dynamic page fetching)..."
+echo "[2/4] Checking Playwright browser..."
 if python3 -c "import playwright" 2>/dev/null; then
-  echo "  Playwright already installed. Run 'python3 -m playwright install chromium' if needed."
+  if python3 -m playwright install chromium >/dev/null 2>&1; then
+    echo "  Chromium browser is ready."
+  else
+    echo "  Could not install Chromium automatically."
+    echo "  You can retry later with: python3 -m playwright install chromium"
+  fi
 else
-  echo "  Skipped. Install later with: pip3 install playwright && python3 -m playwright install chromium"
+  echo "  Playwright package is not available."
+  echo "  Dynamic pages and some China sources may be unavailable until Chromium is installed."
 fi
 
 # 3. Environment variables
 echo ""
-echo "[3/3] Checking environment variables..."
+echo "[3/4] Checking environment variables..."
 
 if [ -f "$PLUGIN_DIR/.env" ]; then
   echo "  .env file already exists at $PLUGIN_DIR/.env"
@@ -43,6 +49,17 @@ else
   else
     echo "  WARNING: No .env.example found."
   fi
+fi
+
+# 4. Post-install self-check
+echo ""
+echo "[4/4] Running self-check..."
+if python3 "$PLUGIN_DIR/benchmarks/self_check.py"; then
+  echo "  Self-check completed."
+else
+  echo "  Self-check reported one or more issues."
+  echo "  Setup is still complete, but some capabilities may be unavailable until dependencies or API keys are fixed."
+  echo "  You can rerun it later with: python3 \"$PLUGIN_DIR/benchmarks/self_check.py\""
 fi
 
 echo ""

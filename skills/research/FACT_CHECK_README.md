@@ -223,7 +223,7 @@ python skills/research/research.py --query "阿斯利康 管线 专利" --format
 # 保存为 claims.json
 cat > claims.json << 'EOF'
 {
-  "key_claims": [
+  "claims": [
     "Farxiga 2024 年销售额 77 亿美元",
     "Tagrisso 2024 年销售额 65.8 亿美元",
     "Tozorakimab COPD Phase 3 试验阳性"

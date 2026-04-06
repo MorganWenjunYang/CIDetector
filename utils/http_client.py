@@ -121,15 +121,19 @@ async def fetch_text_browser(
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context(
-            user_agent=_DEFAULT_USER_AGENT,
-            locale="zh-CN",
-        )
-        page = await ctx.new_page()
-        await page.goto(url, wait_until=wait_until, timeout=int(timeout))
-        content = await page.content()
-        await browser.close()
-        return content
+        ctx = None
+        try:
+            ctx = await browser.new_context(
+                user_agent=_DEFAULT_USER_AGENT,
+                locale="zh-CN",
+            )
+            page = await ctx.new_page()
+            await page.goto(url, wait_until=wait_until, timeout=int(timeout))
+            return await page.content()
+        finally:
+            if ctx is not None:
+                await ctx.close()
+            await browser.close()
 
 
 async def fetch_text_auto(
@@ -147,17 +151,17 @@ async def fetch_text_auto(
         text = await fetch_text(
             url, params=params, headers=headers,
             rate_key=rate_key, rate_limit=rate_limit,
-            timeout=timeout, max_retries=1,
+            timeout=timeout, max_retries=max_retries,
         )
         if _looks_like_antibot(text):
-            raise RuntimeError("anti-bot challenge detected")
+            full_url = url
+            if params:
+                from urllib.parse import urlencode
+                full_url = f"{url}?{urlencode(params)}"
+            return await fetch_text_browser(full_url, timeout=timeout * 1000)
         return text
     except Exception:
-        full_url = url
-        if params:
-            from urllib.parse import urlencode
-            full_url = f"{url}?{urlencode(params)}"
-        return await fetch_text_browser(full_url, timeout=timeout * 1000)
+        raise
 
 
 async def fetch_text_post(
@@ -208,16 +212,15 @@ async def fetch_text_post_auto(
         text = await fetch_text_post(
             url, data=data, headers=headers,
             rate_key=rate_key, rate_limit=rate_limit,
-            timeout=timeout, max_retries=1,
+            timeout=timeout, max_retries=max_retries,
         )
         if _looks_like_antibot(text):
-            raise RuntimeError("anti-bot challenge detected")
+            return await fetch_text_browser_with_form(
+                url, form_data=data, timeout=timeout * 1000
+            )
         return text
     except Exception:
-        # Playwright fallback for POST - navigate to page then fill form
-        return await fetch_text_browser_with_form(
-            url, form_data=data, timeout=timeout * 1000
-        )
+        raise
 
 
 async def fetch_text_browser_with_form(
@@ -232,35 +235,39 @@ async def fetch_text_browser_with_form(
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context(
-            user_agent=_DEFAULT_USER_AGENT,
-            locale="zh-CN",
-        )
-        page = await ctx.new_page()
-        await page.goto(url, wait_until=wait_until, timeout=int(timeout))
+        ctx = None
+        try:
+            ctx = await browser.new_context(
+                user_agent=_DEFAULT_USER_AGENT,
+                locale="zh-CN",
+            )
+            page = await ctx.new_page()
+            await page.goto(url, wait_until=wait_until, timeout=int(timeout))
 
-        # If form data provided, try to fill and submit
-        if form_data:
-            await page.wait_for_timeout(2000)
-            for field_name, field_value in form_data.items():
-                try:
-                    await page.fill(f'[name="{field_name}"]', field_value)
-                except Exception:
+            # If form data provided, try to fill and submit
+            if form_data:
+                await page.wait_for_timeout(2000)
+                for field_name, field_value in form_data.items():
                     try:
-                        await page.fill(f'#{field_name}', field_value)
+                        await page.fill(f'[name="{field_name}"]', field_value)
                     except Exception:
-                        pass
-            await page.wait_for_timeout(3000)
-            # Try to click submit button
-            try:
-                await page.click('input[type="submit"], button[type="submit"]')
-                await page.wait_for_timeout(5000)
-            except Exception:
-                pass
+                        try:
+                            await page.fill(f'#{field_name}', field_value)
+                        except Exception:
+                            pass
+                await page.wait_for_timeout(3000)
+                # Try to click submit button
+                try:
+                    await page.click('input[type="submit"], button[type="submit"]')
+                    await page.wait_for_timeout(5000)
+                except Exception:
+                    pass
 
-        content = await page.content()
-        await browser.close()
-        return content
+            return await page.content()
+        finally:
+            if ctx is not None:
+                await ctx.close()
+            await browser.close()
 
 
 def _looks_like_antibot(html: str) -> bool:
