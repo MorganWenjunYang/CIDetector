@@ -29,9 +29,9 @@ BENCHMARK_RUNNER = PROJECT_ROOT / "benchmarks" / "run_benchmarks.py"
 
 ISSUE_LABEL = "claude-fix"
 BENCHMARK_LABEL = "benchmark-failure"
-CLAUDE_MAX_TURNS = 40
+CLAUDE_MAX_TURNS = 20
 CLAUDE_MAX_BUDGET_USD = 5
-MAX_FIX_ATTEMPTS = 10
+MAX_FIX_ATTEMPTS = 3
 
 _config: dict = {"max_issues": 5, "max_fix_attempts": MAX_FIX_ATTEMPTS}
 
@@ -62,8 +62,14 @@ def _setup_logging(verbose: bool) -> None:
     logger.addHandler(console_handler)
 
 
-def _run(cmd: list[str], *, cwd: str | Path | None = None,
-         check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+def _run(
+    cmd: list[str],
+    *,
+    cwd: str | Path | None = None,
+    check: bool = True,
+    capture: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess:
     """Thin wrapper around subprocess.run with logging."""
     logger.debug("$ %s (cwd=%s)", " ".join(cmd), cwd or ".")
     result = subprocess.run(
@@ -71,6 +77,7 @@ def _run(cmd: list[str], *, cwd: str | Path | None = None,
         capture_output=capture,
         text=True,
         cwd=cwd,
+        timeout=timeout,
     )
     if result.returncode != 0:
         logger.debug("stderr: %s", (result.stderr or "").strip()[:500])
@@ -206,51 +213,291 @@ def _extract_case_name(title: str) -> str | None:
     Title format produced by issue_template:
         [Benchmark][FAIL] ClinicalTrials.gov — http_403_forbidden (2026-04-04)
     """
-    m = re.search(r'\]\s*(.+?)\s*—', title)
+    m = re.search(r'^\[Benchmark\]\[(?:FAIL|WARN)\]\s*(.+?)\s*—', title)
     return m.group(1).strip() if m else None
 
 
-def _verify_fix(worktree_path: Path, case_name: str | None) -> bool:
-    """Run benchmarks in the worktree and check whether the target case passes.
-
-    If *case_name* is provided, runs only that case (via --filter) and checks
-    its individual status.  Falls back to the full suite when case_name is
-    None — passes only when there are zero FAILs.
-    """
+def _verify_fix_with_details(
+    worktree_path: Path, case_name: str | None,
+) -> tuple[bool, dict]:
+    """Run benchmarks in the worktree; return (pass?, structured details for issue text)."""
     runner = worktree_path / "benchmarks" / "run_benchmarks.py"
     cmd = [sys.executable, str(runner), "--verbose"]
     if case_name:
         cmd += ["--filter", case_name]
+
+    details: dict = {
+        "command": " ".join(cmd),
+        "runner_exit_code": None,
+        "json_ok": False,
+        "parse_error": None,
+        "runner_stderr_tail": None,
+        "target_case": case_name,
+        "target_status": None,
+        "target_error": None,
+        "target_duration_sec": None,
+        "suite": None,
+        "failing_cases": None,
+        "pass": False,
+    }
 
     result = subprocess.run(
         cmd, capture_output=True, text=True,
         timeout=180,
         cwd=str(worktree_path),
     )
+    details["runner_exit_code"] = result.returncode
+    err_tail = (result.stderr or "").strip()
+    if err_tail:
+        details["runner_stderr_tail"] = err_tail[-2000:]
+
     try:
         report = json.loads(result.stdout)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError) as e:
+        details["parse_error"] = str(e)
+        out_head = (result.stdout or "")[:1200]
+        details["stdout_head"] = out_head
         logger.warning("Could not parse benchmark output during verification")
-        return False
+        details["pass"] = False
+        return False, details
 
+    details["json_ok"] = True
+    details["suite"] = {
+        "passed": report.get("passed"),
+        "failed": report.get("failed"),
+        "warned": report.get("warned"),
+        "skipped": report.get("skipped"),
+    }
+
+    if "error" in report and report.get("results") is None:
+        details["target_error"] = str(report.get("error") or "").strip() or None
+        details["pass"] = False
+        logger.warning("Benchmark verification returned error payload: %s",
+                       details["target_error"])
+        return False, details
+
+    results = report.get("results", [])
     if case_name:
-        for r in report.get("results", []):
+        for r in results:
             if r["name"] == case_name:
-                return r["status"] == "PASS"
+                details["target_status"] = r.get("status")
+                details["target_error"] = (r.get("error") or "").strip() or None
+                details["target_duration_sec"] = r.get("duration_sec")
+                ok = r["status"] == "PASS"
+                details["pass"] = ok
+                return ok, details
         logger.warning("Case '%s' not found in benchmark results", case_name)
-        return False
+        details["target_error"] = f"case '{case_name}' 未出现在本次 benchmark 结果中"
+        details["pass"] = False
+        return False, details
 
-    return report.get("failed", 1) == 0
+    fail_names = [
+        r["name"] for r in results
+        if r.get("status") == "FAIL"
+    ]
+    warn_names = [
+        r["name"] for r in results
+        if r.get("status") == "WARN"
+    ]
+    details["failing_cases"] = {
+        "FAIL": fail_names,
+        "WARN": warn_names,
+    }
+    ok = report.get("failed", 1) == 0
+    details["pass"] = ok
+    if not ok and fail_names:
+        first = next((r for r in results if r.get("name") in fail_names), None)
+        if first:
+            details["target_error"] = (
+                f"全量模式下首个 FAIL: **{first.get('name')}** — "
+                f"{(first.get('error') or '')[:500]}"
+            ).strip()
+    return ok, details
 
 
-def _extract_attempt_summary(claude_output: str, max_len: int = 1500) -> str:
-    """Return a truncated summary from Claude's output (tail, since conclusions
-    are usually at the end)."""
-    if not claude_output:
-        return "(no output)"
-    if len(claude_output) <= max_len:
-        return claude_output
-    return "…" + claude_output[-max_len:]
+def _verify_fix(worktree_path: Path, case_name: str | None) -> bool:
+    """Run benchmarks in the worktree and check whether the target case passes."""
+    ok, _ = _verify_fix_with_details(worktree_path, case_name)
+    return ok
+
+
+def _collect_git_attempt_summary(worktree_path: Path, base_ref: str) -> dict:
+    """Summarize repo changes vs baseline after Claude (for issue comments)."""
+    stat = _run(
+        ["git", "diff", "--stat", base_ref],
+        cwd=str(worktree_path), check=False,
+    )
+    names = _run(
+        ["git", "diff", "--name-only", base_ref],
+        cwd=str(worktree_path), check=False,
+    )
+    files = [x for x in names.stdout.strip().split("\n") if x]
+    log_r = _run(
+        ["git", "log", f"{base_ref}..HEAD", "--oneline"],
+        cwd=str(worktree_path), check=False,
+    )
+    commits = [ln for ln in log_r.stdout.strip().split("\n") if ln]
+    stat_text = (stat.stdout or "").strip()
+    return {
+        "diff_stat": stat_text if stat_text else "(相对基线无文件差异)",
+        "files": files,
+        "commits_ahead": commits,
+    }
+
+
+def _format_claude_transcript_for_issue(
+    stdout: str | None,
+    stderr: str | None,
+    *,
+    head_chars: int = 3200,
+    tail_chars: int = 3200,
+    stderr_max: int = 2800,
+) -> str:
+    """Readable Claude CLI transcript: stderr + stdout head/tail (agent 'direction')."""
+    blocks: list[str] = []
+    out = (stdout or "").strip()
+    err = (stderr or "").strip()
+
+    if "Reached max turns" in out or "Reached max turns" in err:
+        blocks.append(
+            "> **失败类型**：`Reached max turns` — 本轮在 `--max-turns "
+            f"{CLAUDE_MAX_TURNS}` 内未跑完；下面节选可能**没有最终总结**，"
+            "但通常能看到**前期读了哪些文件、执行了哪些命令**。"
+        )
+
+    if err:
+        e = err if len(err) <= stderr_max else ("…" + err[-stderr_max:])
+        blocks.append("**Claude stderr**（若有）:\n```\n" + e + "\n```")
+
+    if not out:
+        blocks.append("**Claude stdout**: *(空)*")
+        return "\n\n".join(blocks)
+
+    if len(out) <= head_chars + tail_chars + 80:
+        blocks.append("**Claude stdout**（全文）:\n```\n" + out + "\n```")
+    else:
+        h = out[:head_chars]
+        t = out[-tail_chars:]
+        blocks.append(
+            "**Claude stdout**（**首部** — 往往含计划与早期工具调用）:\n```\n"
+            + h + "\n```"
+        )
+        blocks.append(
+            "**Claude stdout**（**尾部** — 往往含最后几步与报错）:\n```\n"
+            + t + "\n```"
+        )
+    return "\n\n".join(blocks)
+
+
+def _format_verification_markdown(v: dict) -> str:
+    """Turn _verify_fix_with_details payload into issue-friendly markdown."""
+    lines = [
+        "##### 验证结果（benchmark）",
+        f"- **命令**: `{v['command']}`",
+        f"- **进程退出码**: `{v['runner_exit_code']}`",
+    ]
+    if not v.get("json_ok"):
+        lines.append("- **JSON 解析**: 失败")
+        if v.get("parse_error"):
+            lines.append(f"  - 原因: `{v['parse_error']}`")
+        if v.get("stdout_head"):
+            lines.append(
+                "- **stdout 开头**（非 JSON 时）:\n```\n"
+                + v["stdout_head"][:800] + "\n```"
+            )
+        if v.get("runner_stderr_tail"):
+            lines.append(
+                "- **stderr 尾部**:\n```\n"
+                + v["runner_stderr_tail"][:1200] + "\n```"
+            )
+        return "\n".join(lines)
+
+    lines.append("- **JSON 解析**: 成功")
+    s = v.get("suite") or {}
+    lines.append(
+        f"- **本 run 汇总**: passed={s.get('passed')!s}, failed={s.get('failed')!s}, "
+        f"warned={s.get('warned')!s}, skipped={s.get('skipped')!s}"
+    )
+    if v.get("target_case"):
+        st = v.get("target_status") or "?"
+        lines.append(f"- **目标 case `{v['target_case']}` 状态**: **{st}**")
+        if v.get("target_duration_sec") is not None:
+            lines.append(f"  - 耗时: {v['target_duration_sec']}s")
+        if v.get("target_error"):
+            err = v["target_error"]
+            if len(err) > 1500:
+                err = err[:1500] + "…"
+            lines.append(f"- **仍失败时的错误/判定**: ```\n{err}\n```")
+    else:
+        fc = v.get("failing_cases") or {}
+        fails = fc.get("FAIL") or []
+        warns = fc.get("WARN") or []
+        if fails:
+            lines.append(f"- **FAIL cases**: {', '.join(f'`{n}`' for n in fails)}")
+        if warns:
+            lines.append(f"- **WARN cases**: {', '.join(f'`{n}`' for n in warns)}")
+        if v.get("target_error"):
+            lines.append(f"- **说明**: {v['target_error']}")
+
+    lines.append(
+        f"- **判定**: {'✅ 验证通过' if v.get('pass') else '❌ 验证未通过（须 PASS / 全量零 FAIL）'}"
+    )
+    return "\n".join(lines)
+
+
+def _format_git_attempt_markdown(g: dict) -> str:
+    """Git change summary for one fix attempt."""
+    lines = [
+        "##### 代码与提交动向（相对本轮基线 commit）",
+        f"- **涉及文件** ({len(g['files'])}): "
+        + (", ".join(f"`{f}`" for f in g["files"]) if g["files"] else "*(无)*"),
+        "- **diff --stat**:\n```\n" + g["diff_stat"] + "\n```",
+    ]
+    if g.get("commits_ahead"):
+        lines.append("- **基线之后的 commit**:")
+        for c in g["commits_ahead"][:15]:
+            lines.append(f"  - `{c}`")
+        if len(g["commits_ahead"]) > 15:
+            lines.append(f"  - … 另有 {len(g['commits_ahead']) - 15} 条")
+    else:
+        lines.append("- **基线之后的 commit**: *(无)*")
+    return "\n".join(lines)
+
+
+def _compact_attempt_retry_summary(
+    verification: dict,
+    git_summary: dict,
+    claude_exit: int,
+    stdout: str,
+    stderr: str,
+    max_len: int = 800,
+) -> str:
+    """Short line for build_fix_prompt RETRY CONTEXT (must stay small)."""
+    chunks: list[str] = []
+    if verification.get("json_ok"):
+        tc = verification.get("target_case")
+        st = verification.get("target_status")
+        if tc:
+            chunks.append(f"验证 case={tc} → {st}")
+        else:
+            s = verification.get("suite") or {}
+            chunks.append(
+                f"验证全量 failed={s.get('failed')!s} warned={s.get('warned')!s}"
+            )
+        err = (verification.get("target_error") or "").strip()
+        if err:
+            chunks.append(f"错误摘录: {err[:220]}")
+    else:
+        chunks.append("验证: stdout 非 JSON 或解析失败")
+    fl = git_summary.get("files") or []
+    chunks.append(f"改动文件: {', '.join(fl[:6]) or '无'}")
+    if claude_exit != 0:
+        chunks.append(f"claude_exit={claude_exit}")
+    blob = (stdout or "") + (stderr or "")
+    if "Reached max turns" in blob:
+        chunks.append("Claude 达 max-turns 未结束")
+    text = " | ".join(chunks)
+    return text if len(text) <= max_len else text[: max_len - 1] + "…"
 
 
 # ---------------------------------------------------------------------------
@@ -345,11 +592,29 @@ def _get_open_issues() -> list[dict]:
         return []
 
 
-def _branch_exists_remote(branch: str) -> bool:
-    result = _run(
-        ["git", "ls-remote", "--heads", "origin", branch],
-        cwd=str(PROJECT_ROOT), check=False,
-    )
+def _branch_exists_remote(
+    branch: str, *, on_timeout_treat_as_exists: bool = False,
+) -> bool:
+    """Return True if *branch* exists on origin.
+
+    Uses a bounded wait so cleanup after Ctrl+C does not hang on slow networks.
+    On timeout: when *on_timeout_treat_as_exists* is True (cleanup path), assume
+    the branch exists so we do not delete a possibly-pushed branch.
+    """
+    try:
+        result = _run(
+            ["git", "ls-remote", "--heads", "origin", branch],
+            cwd=str(PROJECT_ROOT),
+            check=False,
+            timeout=60.0,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "git ls-remote timed out for %s — treating as %s",
+            branch,
+            "remote exists" if on_timeout_treat_as_exists else "not on remote",
+        )
+        return on_timeout_treat_as_exists
     return bool(result.stdout.strip())
 
 
@@ -419,6 +684,25 @@ def _fix_issue(issue: dict) -> bool:
                 _run(["git", "clean", "-fd"],
                      cwd=str(worktree_path), check=False)
 
+            # ----- Preflight: if the target benchmark already passes on the
+            # current baseline, do not attribute the resolution to a new agent run.
+            logger.info("Preflight benchmark check before launching Claude (case=%s) …",
+                        case_name or "ALL")
+            preflight_passed, preflight_details = _verify_fix_with_details(
+                worktree_path, case_name)
+            if case_name and preflight_passed:
+                logger.info("Issue #%d already passes before agent run (attempt %d)",
+                            number, attempt)
+                _comment_and_close_issue(
+                    number,
+                    case_name=case_name,
+                    verification_details=preflight_details,
+                    claude_output="",
+                    claude_exit_code=None,
+                    preflight=True,
+                )
+                return True
+
             # ----- Run Claude -----
             from orchestrate.prompts.fix_prompt import build_fix_prompt
             prompt = build_fix_prompt(
@@ -455,7 +739,8 @@ def _fix_issue(issue: dict) -> bool:
 
             # ----- Verify BEFORE committing -----
             logger.info("Verifying fix with benchmark (case=%s) …", case_name or "ALL")
-            benchmark_passed = _verify_fix(worktree_path, case_name)
+            benchmark_passed, verification_details = _verify_fix_with_details(
+                worktree_path, case_name)
 
             # ----- Scenario 2: resolved with code → commit now -----
             if benchmark_passed and has_code_changes:
@@ -473,25 +758,59 @@ def _fix_issue(issue: dict) -> bool:
             if benchmark_passed and not has_code_changes:
                 logger.info("Issue #%d resolved without code changes (attempt %d)",
                              number, attempt)
-                _comment_and_close_issue(number, claude_output)
+                _comment_and_close_issue(
+                    number,
+                    case_name=case_name,
+                    verification_details=verification_details,
+                    claude_output=claude_output,
+                    claude_exit_code=claude_result.returncode,
+                    preflight=False,
+                )
                 return True
 
             # ----- Not resolved — record and retry -----
+            git_summary = _collect_git_attempt_summary(worktree_path, base_ref)
+            raw_out = claude_result.stdout or ""
+            raw_err = claude_result.stderr or ""
             attempt_history.append({
                 "attempt": attempt,
                 "had_code_changes": has_code_changes,
-                "summary": _extract_attempt_summary(claude_output),
+                "claude_exit_code": claude_result.returncode,
+                "summary": _compact_attempt_retry_summary(
+                    verification_details,
+                    git_summary,
+                    claude_result.returncode,
+                    raw_out,
+                    raw_err,
+                ),
+                "verification": verification_details,
+                "git": git_summary,
+                "claude_stdout": raw_out,
+                "claude_stderr": raw_err,
             })
             logger.warning("Attempt %d/%d failed for issue #%d — benchmark still failing",
                            attempt, max_attempts, number)
 
         # ----- Scenario 3: exhausted all attempts -----
         logger.warning("Issue #%d unresolved after %d attempts", number, max_attempts)
-        _comment_unresolved(number, attempt_history)
+        _comment_unresolved(
+            number,
+            attempt_history,
+            case_name=case_name,
+            max_attempts=max_attempts,
+            branch=branch,
+        )
         return False
 
     finally:
-        _cleanup_worktree(worktree_path, branch)
+        try:
+            _cleanup_worktree(worktree_path, branch)
+        except KeyboardInterrupt:
+            logger.warning(
+                "Cleanup interrupted (Ctrl+C). Finish manually if needed: "
+                "git worktree prune; git branch -D %s (only if never pushed).",
+                branch,
+            )
 
 
 def _branch_has_new_commits(worktree_path: Path) -> bool:
@@ -549,30 +868,80 @@ def _push_and_create_pr(
     return pr_result.returncode == 0
 
 
-def _comment_and_close_issue(number: int, claude_output: str) -> None:
-    """Scenario 1 — resolved without code changes.
+def _comment_and_close_issue(
+    number: int,
+    *,
+    case_name: str | None,
+    verification_details: dict,
+    claude_output: str,
+    claude_exit_code: int | None,
+    preflight: bool,
+) -> None:
+    """Close an issue when benchmark passes without new repo code changes.
 
-    Post Claude's findings as a comment and close the issue.
+    This covers two cases:
+    1) The benchmark already passed before launching the agent
+    2) The benchmark passed after the run, but the worktree still has no new
+       repo changes attributable to this attempt
     """
-    if claude_output:
-        max_len = 60000
-        if len(claude_output) > max_len:
-            claude_output = claude_output[:max_len] + "\n\n… (truncated)"
-        comment = (
-            "## ✅ Auto-fix 结果：已解决（无需代码变更）\n\n"
-            "Claude 已完成调查，benchmark 已通过。问题无需代码变更即可解决。\n\n"
-            "### 诊断报告\n\n"
-            f"{claude_output}\n\n"
-            "---\n"
-            "*Auto-resolved by `orchestrate/orchestrator.py fix`*"
+    header = "## ✅ Auto-fix 结果：当前 benchmark 已通过（未产生新的仓库代码变更）"
+    if preflight:
+        intro = (
+            "在启动修复代理前，目标 benchmark 已经通过。更合理的解释是："
+            "问题已被仓库现有代码修复、上游数据源已恢复，或该失败本身具有瞬时性。"
         )
     else:
-        comment = (
-            "## ✅ Auto-fix 结果：已解决（无需代码变更）\n\n"
-            "Claude 已完成调查，benchmark 已通过。未产生代码变更。\n\n"
-            "---\n"
-            "*Auto-resolved by `orchestrate/orchestrator.py fix`*"
+        intro = (
+            "本轮验证时 benchmark 已通过，但 worktree 相对基线未检测到新的仓库代码改动。"
+            "因此不应将这次关闭解读为“本轮 agent 通过提交代码完成修复”；"
+            "更可能是现有代码已覆盖该问题、上游数据源恢复，或失败具有瞬时性。"
         )
+
+    sections = [
+        header,
+        "",
+        intro,
+        "",
+        "### 验证结果",
+        "",
+        _format_verification_markdown(verification_details),
+    ]
+
+    if case_name:
+        sections.extend([
+            "",
+            f"- **目标 case**: `{case_name}`",
+        ])
+    if claude_exit_code is not None:
+        sections.extend([
+            f"- **修复代理退出码**: `{claude_exit_code}`",
+        ])
+
+    trimmed_output = (claude_output or "").strip()
+    if trimmed_output:
+        max_len = 12000
+        transcript = _format_claude_transcript_for_issue(
+            trimmed_output,
+            "",
+            head_chars=2400,
+            tail_chars=2400,
+            stderr_max=2000,
+        )
+        if len(transcript) > max_len:
+            transcript = transcript[:max_len] + "\n\n… *(代理输出过长已截断)*"
+        sections.extend([
+            "",
+            "### 代理输出（供参考）",
+            "",
+            transcript,
+        ])
+
+    sections.extend([
+        "",
+        "---",
+        "*Auto-resolved by `orchestrate/orchestrator.py fix`*",
+    ])
+    comment = "\n".join(sections)
 
     _run(
         ["gh", "issue", "comment", str(number), "--body", comment],
@@ -585,27 +954,101 @@ def _comment_and_close_issue(number: int, claude_output: str) -> None:
     logger.info("Commented and closed issue #%d (resolved without code)", number)
 
 
-def _comment_unresolved(number: int, attempts: list[dict]) -> None:
+def _format_fix_methodology_markdown(
+    *,
+    case_name: str | None,
+    max_attempts: int,
+    branch: str,
+) -> str:
+    """Human-readable description of what `fix` actually did (for issue comments)."""
+    verify_cmd = (
+        f"`python benchmarks/run_benchmarks.py --verbose --filter {case_name}`"
+        if case_name
+        else "`python benchmarks/run_benchmarks.py --verbose`（全量，要求零 FAIL）"
+    )
+    case_line = (
+        f"从标题解析的 benchmark case：**`{case_name}`**。"
+        if case_name
+        else "未能从标题解析 case 名，验证时跑 **全量** benchmark。"
+    )
+    return (
+        "### 本次使用的方法（自动化流水线）\n\n"
+        f"{case_line}\n\n"
+        "| 环节 | 做法 |\n"
+        "|------|------|\n"
+        f"| 工作副本 | 独立 `git worktree`，分支 `{branch}`；每轮重试前 `git reset --hard` + `git clean -fd` 恢复基线 |\n"
+        "| 修复代理 | **Claude Code CLI**：非交互 `-p` 提示词 + "
+        f"`--allowedTools Read,Edit,Write,Bash` + `--max-turns {CLAUDE_MAX_TURNS}` |\n"
+        "| 单次对话 | 每轮最多 **{CLAUDE_MAX_TURNS}** 个 agent turns；若日志出现 "
+        "`Reached max turns`，表示在该轮内对话预算用尽（非 orchestrator 重试次数） |\n"
+        f"| 验证 | worktree 内执行 {verify_cmd}，解析 stdout JSON；"
+        "须判定目标 case 为 `PASS`（或全量时 `failed == 0`）才算修复成功 |\n"
+        f"| 重试 | orchestrator 层最多 **{max_attempts}** 轮；每轮为新进程，"
+        "后续轮次会把前几轮的简要结果传入 `build_fix_prompt` 作为上下文 |\n"
+    )
+
+
+def _comment_unresolved(
+    number: int,
+    attempts: list[dict],
+    *,
+    case_name: str | None,
+    max_attempts: int,
+    branch: str,
+) -> None:
     """Scenario 3 — unresolved after all attempts.
 
     Post a summary of every failed attempt as a comment but keep the issue
     open so a human can pick it up.
     """
+    methodology = _format_fix_methodology_markdown(
+        case_name=case_name,
+        max_attempts=max_attempts,
+        branch=branch,
+    )
+
     attempt_sections: list[str] = []
     for rec in attempts:
         code_tag = "有代码改动（benchmark 仍未通过）" if rec["had_code_changes"] else "无代码改动"
-        summary = rec["summary"][:1000]
-        attempt_sections.append(
-            f"### 尝试 {rec['attempt']}\n"
-            f"- **状态**: {code_tag}\n"
-            f"- **摘要**:\n\n"
-            f"```\n{summary}\n```"
+        exit_code = rec.get("claude_exit_code")
+        exit_line = (
+            f"- **Claude 进程退出码**: `{exit_code}`\n"
+            if exit_code is not None
+            else ""
         )
+        if rec.get("verification") is not None and rec.get("git") is not None:
+            transcript = _format_claude_transcript_for_issue(
+                rec.get("claude_stdout"),
+                rec.get("claude_stderr"),
+                head_chars=2600,
+                tail_chars=2600,
+                stderr_max=2400,
+            )
+            if len(transcript) > 12000:
+                transcript = transcript[:12000] + "\n\n… *(代理 transcript 过长已截断)*"
+            attempt_sections.append(
+                f"#### 尝试 {rec['attempt']}\n\n"
+                f"- **工作区是否有改动（暂存区/工作树相对基线）**: {code_tag}\n"
+                f"{exit_line}\n"
+                f"{_format_verification_markdown(rec['verification'])}\n\n"
+                f"{_format_git_attempt_markdown(rec['git'])}\n\n"
+                f"##### 代理侧（Claude CLI）\n{transcript}"
+            )
+        else:
+            summary = (rec.get("summary") or "")[:1200]
+            attempt_sections.append(
+                f"#### 尝试 {rec['attempt']}\n"
+                f"- **代码变更**: {code_tag}\n"
+                f"{exit_line}"
+                f"- **摘要**（历史格式）:\n\n```\n{summary}\n```"
+            )
 
     body_parts = "\n\n".join(attempt_sections)
 
     comment = (
         f"## ❌ Auto-fix 失败：经过 {len(attempts)} 次尝试未能解决\n\n"
+        f"{methodology}\n"
+        "### 各轮结果\n\n"
         f"{body_parts}\n\n"
         "---\n"
         "此 issue 保持 **打开** 状态，需要人工介入排查。\n\n"
@@ -631,7 +1074,7 @@ def _cleanup_worktree(worktree_path: Path, branch: str) -> None:
     if worktree_path.exists():
         logger.warning("Worktree directory still exists, removing manually: %s", worktree_path)
         shutil.rmtree(worktree_path, ignore_errors=True)
-    if not _branch_exists_remote(branch):
+    if not _branch_exists_remote(branch, on_timeout_treat_as_exists=True):
         _run(["git", "branch", "-D", branch], cwd=str(PROJECT_ROOT), check=False)
 
 

@@ -19,10 +19,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
 DEFAULT_CASES_FILE = Path(__file__).resolve().parent / "benchmark_cases.yaml"
 TIMEOUT_SEC = 60
+FETCH_PREVIEW_MAX_ITEMS = 3
+FETCH_PREVIEW_CONTENT_LEN = 280
+FETCH_PREVIEW_FETCH_PAGE_LEN = 500
 
 
 def load_cases(path: Path) -> list[dict]:
@@ -39,6 +44,19 @@ def check_env(requires: list[str]) -> str | None:
     return None
 
 
+def is_benchmark_real_search_item(item: object) -> bool:
+    """True if a tool item is actual fetched data (not error rows or HKEX/SSE fallbacks)."""
+    if not isinstance(item, dict):
+        return False
+    md = item.get("metadata") or {}
+    if md.get("error"):
+        return False
+    # search_stock_disclosure.py: synthetic link when API/parsing yields no rows
+    if md.get("fallback") is True:
+        return False
+    return True
+
+
 def validate_search_output(data: dict) -> str | None:
     """Validate standard search tool output. Returns error message or None."""
     if "source" not in data:
@@ -48,14 +66,19 @@ def validate_search_output(data: dict) -> str | None:
         return "missing 'items' field"
     if not isinstance(items, list):
         return f"'items' is {type(items).__name__}, expected list"
-    real_items = [
-        i for i in items if not i.get("metadata", {}).get("error")
-    ]
+    real_items = [i for i in items if is_benchmark_real_search_item(i)]
     if len(real_items) == 0:
         error_msgs = [
-            i.get("title", "") for i in items if i.get("metadata", {}).get("error")
+            i.get("title", "") for i in items if isinstance(i, dict) and (i.get("metadata") or {}).get("error")
         ]
         detail = "; ".join(error_msgs[:2]) if error_msgs else ""
+        if not detail and items:
+            fallback_only = all(
+                isinstance(i, dict) and (i.get("metadata") or {}).get("fallback") is True
+                for i in items
+            )
+            if fallback_only:
+                detail = "only fallback placeholders (no parsed filings)"
         return f"0 real items out of {len(items)} total. {detail}".strip()
     return None
 
@@ -70,6 +93,65 @@ def validate_fetch_page_output(data: dict) -> str | None:
     return None
 
 
+def _truncate(s: str, max_len: int) -> str:
+    s = s or ""
+    if len(s) <= max_len:
+        return s
+    return s[:max_len] + "..."
+
+
+def build_fetched_preview(data: dict, check_mode: str) -> dict | None:
+    """Compact snapshot of tool JSON for benchmark reports (size-bounded)."""
+    if not isinstance(data, dict):
+        return None
+    if check_mode == "fetch_page":
+        content = data.get("content")
+        text = content if isinstance(content, str) else ("" if content is None else str(content))
+        return {
+            "source": data.get("source"),
+            "content_length": len(text),
+            "content_preview": _truncate(text, FETCH_PREVIEW_FETCH_PAGE_LEN),
+        }
+    items = data.get("items")
+    if not isinstance(items, list):
+        return {
+            "source": data.get("source"),
+            "item_count": 0,
+            "real_item_count": 0,
+            "sample": [],
+        }
+    real = [i for i in items if is_benchmark_real_search_item(i)]
+    sample: list[dict] = []
+    for i in items[:FETCH_PREVIEW_MAX_ITEMS]:
+        if not isinstance(i, dict):
+            continue
+        md = i.get("metadata") or {}
+        err = md.get("error")
+        entry: dict = {
+            "title": _truncate(str(i.get("title") or ""), 200),
+            "url": _truncate(str(i.get("url") or ""), 400),
+        }
+        if md.get("fallback") is True:
+            entry["placeholder"] = "fallback"
+        if err:
+            entry["error"] = _truncate(str(err), 400)
+        else:
+            c = i.get("content")
+            cs = c if isinstance(c, str) else ("" if c is None else str(c))
+            if cs:
+                entry["content_preview"] = _truncate(cs, FETCH_PREVIEW_CONTENT_LEN)
+        pub = i.get("published_at")
+        if pub:
+            entry["published_at"] = str(pub)[:80]
+        sample.append(entry)
+    return {
+        "source": data.get("source"),
+        "item_count": len(items),
+        "real_item_count": len(real),
+        "sample": sample,
+    }
+
+
 def run_case(case: dict, verbose: bool = False) -> dict:
     name = case["name"]
     tool = case["tool"]
@@ -80,7 +162,12 @@ def run_case(case: dict, verbose: bool = False) -> dict:
 
     missing_env = check_env(requires_env)
     if missing_env:
-        return {"name": name, "status": "SKIP", "error": f"{missing_env} not set", "duration_sec": 0}
+        return {
+            "name": name,
+            "status": "SKIP",
+            "error": f"{missing_env} not set",
+            "duration_sec": 0,
+        }
 
     cmd = [sys.executable, tool] + args
     if verbose:
@@ -98,20 +185,37 @@ def run_case(case: dict, verbose: bool = False) -> dict:
     except subprocess.TimeoutExpired:
         duration = time.monotonic() - start
         status = "WARN" if fragile else "FAIL"
-        return {"name": name, "status": status, "error": f"timeout after {TIMEOUT_SEC}s", "duration_sec": round(duration, 1)}
+        return {
+            "name": name,
+            "status": status,
+            "error": f"timeout after {TIMEOUT_SEC}s",
+            "duration_sec": round(duration, 1),
+        }
     duration = time.monotonic() - start
 
     if result.returncode != 0:
         stderr_snippet = result.stderr.strip()[:300]
         status = "WARN" if fragile else "FAIL"
-        return {"name": name, "status": status, "error": f"exit code {result.returncode}: {stderr_snippet}", "duration_sec": round(duration, 1)}
+        return {
+            "name": name,
+            "status": status,
+            "error": f"exit code {result.returncode}: {stderr_snippet}",
+            "duration_sec": round(duration, 1),
+        }
 
     try:
         data = json.loads(result.stdout)
     except (json.JSONDecodeError, ValueError) as e:
         stdout_snippet = result.stdout.strip()[:200]
         status = "WARN" if fragile else "FAIL"
-        return {"name": name, "status": status, "error": f"invalid JSON: {e}. stdout starts with: {stdout_snippet}", "duration_sec": round(duration, 1)}
+        return {
+            "name": name,
+            "status": status,
+            "error": f"invalid JSON: {e}. stdout starts with: {stdout_snippet}",
+            "duration_sec": round(duration, 1),
+        }
+
+    fetched = build_fetched_preview(data, check_mode)
 
     if check_mode == "fetch_page":
         err = validate_fetch_page_output(data)
@@ -120,9 +224,24 @@ def run_case(case: dict, verbose: bool = False) -> dict:
 
     if err:
         status = "WARN" if fragile else "FAIL"
-        return {"name": name, "status": status, "error": err, "duration_sec": round(duration, 1)}
+        out: dict = {
+            "name": name,
+            "status": status,
+            "error": err,
+            "duration_sec": round(duration, 1),
+        }
+        if fetched is not None:
+            out["fetched"] = fetched
+        return out
 
-    return {"name": name, "status": "PASS", "duration_sec": round(duration, 1)}
+    out_pass: dict = {
+        "name": name,
+        "status": "PASS",
+        "duration_sec": round(duration, 1),
+    }
+    if fetched is not None:
+        out_pass["fetched"] = fetched
+    return out_pass
 
 
 def main() -> None:

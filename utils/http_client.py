@@ -160,6 +160,109 @@ async def fetch_text_auto(
         return await fetch_text_browser(full_url, timeout=timeout * 1000)
 
 
+async def fetch_text_post(
+    url: str,
+    *,
+    data: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+    rate_key: str | None = None,
+    rate_limit: float = 3.0,
+    timeout: float = _DEFAULT_TIMEOUT,
+    max_retries: int = _DEFAULT_MAX_RETRIES,
+) -> str:
+    """POST *url* and return response body as text."""
+    if rate_key:
+        limiter = get_limiter(rate_key, rate_limit)
+
+    merged = _merge_headers(headers)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        for attempt in range(1, max_retries + 1):
+            if rate_key:
+                await limiter.acquire()
+            try:
+                resp = await client.post(url, data=data, headers=merged)
+                resp.raise_for_status()
+                return resp.text
+            except (httpx.HTTPStatusError, httpx.TransportError):
+                if attempt == max_retries:
+                    raise
+                await asyncio.sleep(_DEFAULT_BACKOFF * attempt)
+    return ""  # unreachable, keeps type-checker happy
+
+
+async def fetch_text_post_auto(
+    url: str,
+    *,
+    data: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+    rate_key: str | None = None,
+    rate_limit: float = 3.0,
+    timeout: float = _DEFAULT_TIMEOUT,
+    max_retries: int = _DEFAULT_MAX_RETRIES,
+) -> str:
+    """Try POST request first; fall back to Playwright if blocked by anti-bot.
+
+    For Playwright fallback, fills form fields via JavaScript.
+    """
+    try:
+        text = await fetch_text_post(
+            url, data=data, headers=headers,
+            rate_key=rate_key, rate_limit=rate_limit,
+            timeout=timeout, max_retries=1,
+        )
+        if _looks_like_antibot(text):
+            raise RuntimeError("anti-bot challenge detected")
+        return text
+    except Exception:
+        # Playwright fallback for POST - navigate to page then fill form
+        return await fetch_text_browser_with_form(
+            url, form_data=data, timeout=timeout * 1000
+        )
+
+
+async def fetch_text_browser_with_form(
+    url: str,
+    *,
+    form_data: dict[str, str] | None = None,
+    wait_until: str = "networkidle",
+    timeout: float = 30000,
+) -> str:
+    """Fetch via Playwright, optionally filling a form with POST data."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx = await browser.new_context(
+            user_agent=_DEFAULT_USER_AGENT,
+            locale="zh-CN",
+        )
+        page = await ctx.new_page()
+        await page.goto(url, wait_until=wait_until, timeout=int(timeout))
+
+        # If form data provided, try to fill and submit
+        if form_data:
+            await page.wait_for_timeout(2000)
+            for field_name, field_value in form_data.items():
+                try:
+                    await page.fill(f'[name="{field_name}"]', field_value)
+                except Exception:
+                    try:
+                        await page.fill(f'#{field_name}', field_value)
+                    except Exception:
+                        pass
+            await page.wait_for_timeout(3000)
+            # Try to click submit button
+            try:
+                await page.click('input[type="submit"], button[type="submit"]')
+                await page.wait_for_timeout(5000)
+            except Exception:
+                pass
+
+        content = await page.content()
+        await browser.close()
+        return content
+
+
 def _looks_like_antibot(html: str) -> bool:
     """Heuristic: detect common anti-bot challenge pages."""
     markers = [
@@ -174,6 +277,14 @@ def _looks_like_antibot(html: str) -> bool:
         "function _$",
         "r='m'",
         "<script type='text/javascript' r='m'>",
+        # ChiCTR / general WAF verification pages
+        "Access Verification",
+        "slide to verify",
+        "slide to complete the verification",
+        "Please slide to verify",
+        "Please complete the verification",
+        "验证完成",
+        "滑块验证",
     ]
     head = html[:3000].lower()
     return any(m.lower() in head for m in markers)
