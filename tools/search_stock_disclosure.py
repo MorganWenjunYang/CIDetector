@@ -19,7 +19,6 @@ from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from utils.http_client import fetch_json, fetch_text
 from utils.parsers import parse_html, extract_text, safe_json_output
 from utils.cache import cache_key, get as cache_get, put as cache_put
 
@@ -180,8 +179,10 @@ HKEX_18A_CODES = {
 async def _search_hkex(query: str, max_results: int) -> list[dict]:
     """Search HKEXnews for company announcements.
 
-    For biotech companies, we can directly lookup by stock code.
-    Note: HKEX uses Traditional Chinese encoding.
+    `sources.md` points to https://www.hkexnews.hk/index_c.htm.
+    The public title-search page is brittle for direct query-string scraping, so
+    we use HKEXnews' public content-search flow in a headless browser first.
+    If that fails, we still fall back to the known-company references below.
     """
     items: list[dict] = []
 
@@ -202,69 +203,46 @@ async def _search_hkex(query: str, max_results: int) -> list[dict]:
         search_query = simplify_to_traditional(query)
 
     try:
-        import httpx
-
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
-            resp = await client.get(
-                "https://www1.hkexnews.hk/search/titlesearch.xhtml",
-                params={
-                    "lang": "ZH",
-                    "market": "SEHK",
-                    "searchType": "0",
-                    "t1code": "40000",
-                    "t2Gcode": "-2",
-                    "t2code": "-2",
-                    "query": search_query,
-                    "from": "20200101",
-                    "to": "",
-                    "rowRange": f"1-{max_results}",
-                },
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-                },
-            )
-            resp.raise_for_status()
-            html = resp.text
-
-        # Try multiple selectors for HKEX results
+        html = await _search_hkex_content_page(search_query)
         soup = parse_html(html)
-        selectors = [
-            "table.table tr",
-            "div.result-item",
-            "tr.Row0",
-            "tr.Row1",
-            "div#resultList table tr",
-            "table.result-table tr",
-        ]
 
-        for selector in selectors:
-            rows = soup.select(selector)
-            if rows:
+        candidate_rows = (
+            soup.select("table tr")
+            or soup.select("tr.Row0, tr.Row1")
+            or soup.select("div.result-item, li.result-item, li.search-result")
+        )
+
+        for row in candidate_rows:
+            link = row.find("a", href=True)
+            if not link:
+                continue
+            href = link.get("href", "")
+            title = extract_text(link)
+            row_text = extract_text(row)
+            if not href or len(title) < 5:
+                continue
+            if href.startswith("/"):
+                href = f"https://www3.hkexnews.hk{href}"
+            elif not href.startswith("http"):
+                href = f"https://www3.hkexnews.hk/{href.lstrip('./')}"
+
+            date_match = re.search(r"(\d{4}/\d{2}/\d{2}|\d{2}/\d{2}/\d{4})", row_text)
+            stock_code_match = re.search(r"\b\d{4,5}\b", row_text)
+            items.append({
+                "title": title,
+                "url": href,
+                "content": row_text[:500],
+                "published_at": date_match.group(1) if date_match else "",
+                "metadata": {
+                    "exchange": "HKEX",
+                    "stock_code": stock_code_match.group(0) if stock_code_match else "",
+                    "search_query": search_query,
+                    "source_type": "hkex_content_search",
+                },
+            })
+            if len(items) >= max_results:
                 break
-
-        for row in rows[:max_results]:
-            cells = row.select("td")
-            if len(cells) >= 3:
-                date_str = extract_text(cells[0])
-                stock_code = extract_text(cells[1])
-                link = cells[-1].find("a") or cells[2].find("a")
-                title = extract_text(link) if link else extract_text(cells[2])
-                href = ""
-                if link and link.get("href"):
-                    href = link["href"]
-                    if not href.startswith("http"):
-                        href = f"https://www1.hkexnews.hk{href}"
-                items.append({
-                    "title": title,
-                    "url": href,
-                    "content": f"Stock: {stock_code}",
-                    "published_at": date_str,
-                    "metadata": {
-                        "exchange": "HKEX",
-                        "stock_code": stock_code,
-                    },
-                })
-    except Exception as e:
+    except Exception:
         pass
 
     if not items:
@@ -303,6 +281,85 @@ async def _search_hkex(query: str, max_results: int) -> list[dict]:
             })
 
     return items
+
+
+async def _search_hkex_content_page(search_query: str) -> str:
+    """Use HKEXnews public search in a headless browser.
+
+    The exact GET parameters are unstable; browser interaction is much more
+    reliable than scraping `titlesearch.xhtml` directly.
+    """
+    from playwright.async_api import async_playwright
+
+    urls = [
+        "https://www3.hkexnews.hk/listedco/listconews/advancedsearch/search_active_main.aspx",
+        "https://www3.hkexnews.hk/search/eps/EPSSearch.html",
+        "https://www.hkexnews.hk/index_c.htm",
+    ]
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx = await browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            locale="zh-HK",
+        )
+        page = await ctx.new_page()
+        try:
+            loaded = False
+            for url in urls:
+                try:
+                    await page.goto(url, wait_until="load", timeout=15000)
+                    loaded = True
+                    break
+                except Exception:
+                    continue
+            if not loaded:
+                raise RuntimeError("unable to open HKEX search page")
+
+            await page.wait_for_timeout(2000)
+
+            input_selectors = [
+                'input[name*="search"], input[id*="search"]',
+                'input[name*="keyword"], input[id*="keyword"]',
+                'input[name*="phrase"], input[id*="phrase"]',
+                'input[type="text"]',
+            ]
+            filled = False
+            for selector_group in input_selectors:
+                try:
+                    locator = page.locator(selector_group).first
+                    await locator.fill(search_query)
+                    filled = True
+                    break
+                except Exception:
+                    continue
+            if not filled:
+                raise RuntimeError("unable to locate HKEX search input")
+
+            clicked = False
+            for button_selector in [
+                'input[type="submit"]',
+                'button[type="submit"]',
+                'button:has-text("Search")',
+                'button:has-text("搜尋")',
+                'input[value*="Search"]',
+                'input[value*="搜尋"]',
+            ]:
+                try:
+                    await page.locator(button_selector).first.click(timeout=3000)
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+            if not clicked:
+                await page.keyboard.press("Enter")
+
+            await page.wait_for_timeout(5000)
+            return await page.content()
+        finally:
+            await ctx.close()
+            await browser.close()
 
 
 # ---------------------------------------------------------------------------

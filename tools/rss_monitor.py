@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from utils.http_client import fetch_text
-from utils.parsers import safe_json_output
+from utils.parsers import parse_html, extract_text, safe_json_output
 
 FEEDS: dict[str, dict] = {
     "fierce": {
@@ -36,6 +36,9 @@ FEEDS: dict[str, dict] = {
     "prn": {
         "name": "PR Newswire - Health",
         "url": "https://www.prnewswire.com/rss/health-latest-news/health-latest-news-list.rss",
+        "fallback_urls": [
+            "https://www.prnewswire.com/news-releases/health-latest-news/",
+        ],
     },
 }
 
@@ -56,6 +59,10 @@ async def _fetch_feed(key: str, feed_info: dict, keyword: str) -> list[dict]:
             xml = await fetch_text(url, timeout=15)
             parsed = feedparser.parse(xml)
             if not parsed.entries:
+                if key == "prn":
+                    html_items = _parse_prnewswire_listing(xml, keyword)
+                    if html_items:
+                        return html_items
                 continue
 
             for entry in parsed.entries:
@@ -87,6 +94,66 @@ async def _fetch_feed(key: str, feed_info: dict, keyword: str) -> list[dict]:
             "published_at": "",
             "metadata": {"feed": feed_info["name"], "error": True},
         })
+    return items
+
+
+def _parse_prnewswire_listing(html: str, keyword: str, max_items: int = 25) -> list[dict]:
+    """Fallback parser for PR Newswire's HTML listing pages.
+
+    PRNewswire's RSS endpoints occasionally return empty HTML or redirect pages.
+    The official health listing page in `sources.md` is more stable.
+    """
+    soup = parse_html(html)
+    items: list[dict] = []
+    seen_urls: set[str] = set()
+
+    selectors = [
+        "a[href*='/news-releases/']",
+        "div.card a[href]",
+        "article a[href]",
+        "li a[href]",
+    ]
+
+    links = []
+    for selector in selectors:
+        links = soup.select(selector)
+        if links:
+            break
+
+    for link in links:
+        href = link.get("href", "")
+        if not href or "/news-releases/" not in href:
+            continue
+        if href.startswith("/"):
+            href = f"https://www.prnewswire.com{href}"
+        if href in seen_urls:
+            continue
+
+        title = extract_text(link)
+        if not title or len(title) < 8:
+            continue
+
+        container = link.find_parent(["article", "li", "div"])
+        context_text = extract_text(container) if container else title
+        if keyword and not _match(keyword, title + " " + context_text):
+            continue
+
+        published = ""
+        if container:
+            time_el = container.find("time")
+            published = extract_text(time_el) if time_el else ""
+
+        items.append({
+            "title": title,
+            "url": href,
+            "content": context_text[:500],
+            "published_at": published,
+            "metadata": {"feed": "PR Newswire - Health", "via": "html_listing"},
+        })
+        seen_urls.add(href)
+        if len(items) >= max_items:
+            break
+
     return items
 
 

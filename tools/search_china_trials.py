@@ -18,11 +18,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from utils.http_client import fetch_text, fetch_text_auto, fetch_text_post_auto, _looks_like_antibot
+from utils.http_client import fetch_text_auto, fetch_text_post_auto, _looks_like_antibot
 from utils.parsers import parse_html, extract_text, safe_json_output
 from utils.cache import cache_key, get as cache_get, put as cache_put
 
 RATE_KEY = "china_trials"
+CDE_LIST_URL = "https://www.cde.org.cn/main/xxgk/listpage/9f9c74c73e0f8f56a8bfbc646055026d"
+CHINADRUG_INDEX_URL = "https://www.chinadrugtrials.org.cn/index.html"
 
 
 # ---------------------------------------------------------------------------
@@ -32,89 +34,22 @@ RATE_KEY = "china_trials"
 async def _search_cde(query: str, max_results: int) -> list[dict]:
     """Search CDE drug information via the NMPA public data search API.
 
-    The CDE main site (cde.org.cn) has very aggressive anti-bot protection.
-    We use the NMPA datasearch API as the primary source, which is more accessible.
-
-    Fallback chain: NMPA API -> CDE website -> ChinaDrugTrials -> ChiCTR -> ClinicalTrials.gov (China)
+    `sources.md` anchors CDE to the official list page, so we use that as the
+    browser-first primary source. Because CDE is frequently protected by anti-bot
+    measures, we keep a bounded fallback chain and avoid long multi-hop waits.
     """
     items: list[dict] = []
     primary_failures: list[str] = []
 
-    # Try NMPA API first
     try:
-        import httpx
-
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": "https://www.nmpa.gov.cn/datasearch/home-index.html",
-        }
-
-        search_api = "https://www.nmpa.gov.cn/datasearch/search-info.html"
-        params = {
-            "nmpa": "yp",
-            "paramDbId": "",
-            "paramStr": query,
-            "paramPageNum": "1",
-            "paramPageSize": str(max_results),
-        }
-
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            resp = await client.get(search_api, params=params, headers=headers)
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    result_list = data.get("list", [])
-                    for item in result_list[:max_results]:
-                        title = item.get("COLUMN2", item.get("column2", ""))
-                        detail_id = item.get("ID", item.get("id", ""))
-                        if title:  # Only add items with actual content
-                            items.append({
-                                "title": title,
-                                "url": f"https://www.nmpa.gov.cn/datasearch/search-info.html?id={detail_id}",
-                                "content": str(item),
-                                "published_at": item.get("COLUMN5", ""),
-                                "metadata": {"registry": "CDE/NMPA", "requested_registry": "CDE"},
-                            })
-                except Exception as exc:
-                    primary_failures.append(f"nmpa_parse_error:{str(exc)[:120]}")
-
+        items = await asyncio.wait_for(
+            _search_cde_official_page(query, max_results),
+            timeout=12,
+        )
     except Exception as exc:
-        # NMPA API failed, will try fallback below
-        primary_failures.append(f"nmpa_api_error:{str(exc)[:120]}")
+        primary_failures.append(f"cde_official_page_error:{str(exc)[:120]}")
 
-    # Fallback 1: try CDE website directly if NMPA returned no results
-    if not items:
-        try:
-            # Use fetch_text_auto which falls back to Playwright for anti-bot pages
-            html = await fetch_text_auto(
-                "https://www.cde.org.cn/",
-                rate_key=RATE_KEY, rate_limit=2.0, timeout=10,
-            )
-            soup = parse_html(html)
-            q_lower = query.lower()
-            for a_tag in soup.select("a[href]"):
-                title = extract_text(a_tag)
-                href = a_tag.get("href", "")
-                if not title or not href or len(title) < 6:
-                    continue
-                if q_lower and q_lower not in title.lower():
-                    continue
-                full_url = href if href.startswith("http") else f"https://www.cde.org.cn{href}"
-                items.append({
-                    "title": title,
-                    "url": full_url,
-                    "content": "",
-                    "published_at": "",
-                    "metadata": {"registry": "CDE", "requested_registry": "CDE"},
-                })
-                if len(items) >= max_results:
-                    break
-        except Exception as exc:
-            primary_failures.append(f"cde_site_error:{str(exc)[:120]}")
-
-    # Fallback 2: try ChinaDrugTrials if NMPA and CDE both failed
+    # Fallback 1: ChinaDrugTrials official no-login search
     if not items:
         cdth_items = await _search_chinadrugtrials(query, max_results)
         for item in cdth_items:
@@ -127,7 +62,7 @@ async def _search_cde(query: str, max_results: int) -> list[dict]:
                     item["metadata"]["primary_source_errors"] = primary_failures[:3]
                 items.append(item)
 
-    # Fallback 3: use ChiCTR if all else failed
+    # Fallback 2: use ChiCTR if all else failed
     if not items:
         chictr_items = await _search_chictr(query, max_results)
         # Filter out error items and mark as fallback
@@ -141,8 +76,7 @@ async def _search_cde(query: str, max_results: int) -> list[dict]:
                     item["metadata"]["primary_source_errors"] = primary_failures[:3]
                 items.append(item)
 
-    # Fallback 4: ClinicalTrials.gov with China location filter
-    # This is a reliable fallback when all Chinese domestic registries are inaccessible
+    # Fallback 3: ClinicalTrials.gov with China location filter
     if not items:
         ctgov_items = await _search_clinicaltrials_gov_china(query, max_results)
         for item in ctgov_items:
@@ -155,6 +89,54 @@ async def _search_cde(query: str, max_results: int) -> list[dict]:
                     item["metadata"]["primary_source_errors"] = primary_failures[:3]
                 items.append(item)
 
+    return items
+
+
+async def _search_cde_official_page(query: str, max_results: int) -> list[dict]:
+    """Search CDE official page using browser automation on the public list page."""
+    items: list[dict] = []
+    try:
+        html = await fetch_text_auto(
+            CDE_LIST_URL,
+            rate_key=RATE_KEY,
+            rate_limit=1.0,
+            timeout=10,
+            max_retries=1,
+        )
+        soup = parse_html(html)
+        q_lower = query.lower()
+        selectors = [
+            "a[href*='viewInfoCommon']",
+            "a[href*='listpage']",
+            ".list a[href]",
+            "li a[href]",
+            "a[href]",
+        ]
+        links = []
+        for selector in selectors:
+            links = soup.select(selector)
+            if links:
+                break
+
+        for a_tag in links:
+            title = extract_text(a_tag)
+            href = a_tag.get("href", "")
+            if not title or len(title) < 6 or not href:
+                continue
+            if q_lower not in title.lower():
+                continue
+            full_url = href if href.startswith("http") else f"https://www.cde.org.cn{href}"
+            items.append({
+                "title": title,
+                "url": full_url,
+                "content": "Matched from CDE official disclosure list page.",
+                "published_at": "",
+                "metadata": {"registry": "CDE", "requested_registry": "CDE", "source_type": "official_list"},
+            })
+            if len(items) >= max_results:
+                break
+    except Exception:
+        pass
     return items
 
 
@@ -250,15 +232,24 @@ async def _search_clinicaltrials_gov_china(query: str, max_results: int) -> list
 async def _search_chinadrugtrials(query: str, max_results: int) -> list[dict]:
     """Search ChinaDrugTrials public registry.
 
-    The site uses form-based search with anti-bot protection.
-    We use fetch_text_post_auto which falls back to Playwright when blocked.
+    `sources.md` notes the site supports public no-login search. Use the public
+    homepage in a browser first, then fall back to the older form POST flow.
     """
-    search_url = "https://www.chinadrugtrials.org.cn/clinicaltrials.searchlistdetail.dhtml"
     items: list[dict] = []
     try:
-        # Use fetch_text_post_auto for anti-bot bypass
+        items = await asyncio.wait_for(
+            _search_chinadrugtrials_browser(query, max_results),
+            timeout=14,
+        )
+    except Exception:
+        pass
+
+    if items:
+        return items
+
+    try:
         html = await fetch_text_post_auto(
-            search_url,
+            "https://www.chinadrugtrials.org.cn/clinicaltrials.searchlistdetail.dhtml",
             data={
                 "currentpage": "1",
                 "pagesize": str(max_results),
@@ -267,46 +258,121 @@ async def _search_chinadrugtrials(query: str, max_results: int) -> list[dict]:
             },
             rate_key=RATE_KEY,
             rate_limit=1.0,
-            timeout=25,
+            timeout=10,
+            max_retries=1,
         )
-
-        # Check if we got an anti-bot page
         if _looks_like_antibot(html):
             raise RuntimeError("anti-bot page detected")
-
-        soup = parse_html(html)
-        rows = soup.select("table tr")
-        for row in rows[1: max_results + 1]:
-            cells = row.select("td")
-            if len(cells) >= 4:
-                reg_no = extract_text(cells[0])
-                title = extract_text(cells[1])
-                drug = extract_text(cells[2])
-                indication = extract_text(cells[3])
-                link_tag = cells[0].find("a")
-                href = ""
-                if link_tag and link_tag.get("href"):
-                    href = link_tag["href"]
-                    if not href.startswith("http"):
-                        href = f"https://www.chinadrugtrials.org.cn/{href}"
-                if title or reg_no:  # Only add items with actual content
-                    items.append({
-                        "title": title or reg_no,
-                        "url": href,
-                        "content": f"Drug: {drug}. Indication: {indication}.",
-                        "published_at": "",
-                        "metadata": {
-                            "registry": "ChinaDrugTrials",
-                            "registration_no": reg_no,
-                            "drug": drug,
-                            "indication": indication,
-                        },
-                    })
-    except Exception as exc:
-        # Return empty list on error - let fallback sources handle it
-        # Don't add error items that pollute the results
+        items = _parse_chinadrugtrials_results(html, max_results)
+    except Exception:
         pass
+
+    if items:
+        return items
+
+    ctgov_items = await _search_clinicaltrials_gov_china(query, max_results)
+    for item in ctgov_items:
+        if item.get("metadata", {}).get("error"):
+            continue
+        item["metadata"]["fallback_source"] = "ClinicalTrials.gov (China locations)"
+        item["metadata"]["requested_registry"] = "ChinaDrugTrials"
+    return ctgov_items
+
+
+def _parse_chinadrugtrials_results(html: str, max_results: int) -> list[dict]:
+    items: list[dict] = []
+    soup = parse_html(html)
+    rows = soup.select("table tr") or soup.select("tr")
+    for row in rows[1:]:
+        cells = row.select("td")
+        if len(cells) < 2:
+            continue
+        reg_no = extract_text(cells[0])
+        title = extract_text(cells[1])
+        drug = extract_text(cells[2]) if len(cells) > 2 else ""
+        indication = extract_text(cells[3]) if len(cells) > 3 else ""
+        link_tag = row.find("a", href=True)
+        href = ""
+        if link_tag:
+            href = link_tag["href"]
+            if not href.startswith("http"):
+                href = f"https://www.chinadrugtrials.org.cn/{href.lstrip('./')}"
+        if title or reg_no:
+            items.append({
+                "title": title or reg_no,
+                "url": href,
+                "content": f"Drug: {drug}. Indication: {indication}.",
+                "published_at": "",
+                "metadata": {
+                    "registry": "ChinaDrugTrials",
+                    "registration_no": reg_no,
+                    "drug": drug,
+                    "indication": indication,
+                },
+            })
+        if len(items) >= max_results:
+            break
     return items
+
+
+async def _search_chinadrugtrials_browser(query: str, max_results: int) -> list[dict]:
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx = await browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            locale="zh-CN",
+        )
+        page = await ctx.new_page()
+        try:
+            await page.goto(CHINADRUG_INDEX_URL, wait_until="load", timeout=15000)
+            await page.wait_for_timeout(2500)
+            if _looks_like_antibot(await page.content()):
+                raise RuntimeError("anti-bot page detected")
+
+            input_selectors = [
+                '#keywords',
+                'input[name="keywords"]',
+                'input[name="keyword"]',
+                'input[type="text"]',
+            ]
+            filled = False
+            for selector in input_selectors:
+                try:
+                    await page.fill(selector, query)
+                    filled = True
+                    break
+                except Exception:
+                    continue
+            if not filled:
+                raise RuntimeError("search input not found")
+
+            clicked = False
+            for selector in [
+                'button[type="submit"]',
+                'input[type="submit"]',
+                'button:has-text("搜索")',
+                'button:has-text("查询")',
+                'a:has-text("搜索")',
+            ]:
+                try:
+                    await page.locator(selector).first.click(timeout=3000)
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+            if not clicked:
+                await page.keyboard.press("Enter")
+
+            await page.wait_for_timeout(5000)
+            html = await page.content()
+        finally:
+            await ctx.close()
+            await browser.close()
+
+    return _parse_chinadrugtrials_results(html, max_results)
 
 
 # ---------------------------------------------------------------------------

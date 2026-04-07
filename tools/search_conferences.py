@@ -18,7 +18,7 @@ from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from utils.http_client import fetch_text, fetch_text_auto
+from utils.http_client import fetch_text, fetch_text_auto, fetch_json
 from utils.parsers import parse_html, extract_text, safe_json_output
 from utils.cache import cache_key, get as cache_get, put as cache_put
 
@@ -33,8 +33,15 @@ async def _search_aacr(query: str, max_results: int) -> list[dict]:
     """Search AACR journals / abstract archive."""
     items: list[dict] = []
     url = f"https://aacrjournals.org/search-results?page=1&q={quote(query)}&SearchSourceType=1&fl_SiteID=5"
+    primary_error: str | None = None
     try:
-        html = await fetch_text(url, rate_key=RATE_KEY, rate_limit=2.0, timeout=20)
+        html = await fetch_text_auto(
+            url,
+            rate_key=RATE_KEY,
+            rate_limit=2.0,
+            timeout=12,
+            max_retries=1,
+        )
         soup = parse_html(html)
 
         for result_el in soup.select("div.sr-list div.al-citation-list-group, div.highwire-cite-metadata, li.search-result")[:max_results]:
@@ -60,13 +67,17 @@ async def _search_aacr(query: str, max_results: int) -> list[dict]:
                 "metadata": {"conference": "AACR"},
             })
     except Exception as exc:
-        items.append({
-            "title": f"[AACR search error: {exc}]",
-            "url": url,
-            "content": str(exc),
-            "published_at": "",
-            "metadata": {"conference": "AACR", "error": True},
-        })
+        primary_error = str(exc)
+
+    if not items:
+        items = await _search_pubmed_conference_fallback(
+            query,
+            max_results,
+            conference="AACR",
+            pubmed_query=f'{query} AND ("AACR"[All Fields] OR "Cancer Res"[Journal] OR "Clin Cancer Res"[Journal])',
+            source_url=url,
+            primary_error=primary_error,
+        )
     return items
 
 
@@ -135,7 +146,6 @@ async def _search_asco(query: str, max_results: int) -> list[dict]:
 
 async def _search_asco_via_pubmed(query: str, max_results: int) -> list[dict]:
     """Fallback: search PubMed for ASCO abstracts published in JCO."""
-    from utils.http_client import fetch_json
     items: list[dict] = []
     try:
         pubmed_query = f"{query} AND (\"J Clin Oncol\"[Journal] OR \"ASCO\"[All Fields])"
@@ -183,45 +193,133 @@ async def _search_asco_via_pubmed(query: str, max_results: int) -> list[dict]:
     return items
 
 
+async def _search_pubmed_conference_fallback(
+    query: str,
+    max_results: int,
+    *,
+    conference: str,
+    pubmed_query: str,
+    source_url: str,
+    primary_error: str | None,
+) -> list[dict]:
+    """Shared PubMed fallback for conferences with brittle official search pages."""
+    items: list[dict] = []
+    try:
+        search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        search_data = await fetch_json(
+            search_url,
+            params={
+                "db": "pubmed",
+                "term": pubmed_query,
+                "retmax": str(max_results),
+                "retmode": "json",
+                "sort": "pub_date",
+            },
+            rate_key="pubmed",
+            rate_limit=3.0,
+        )
+        id_list = search_data.get("esearchresult", {}).get("idlist", [])
+        if not id_list:
+            return items
+
+        summary_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+        summary_data = await fetch_json(
+            summary_url,
+            params={"db": "pubmed", "id": ",".join(id_list), "retmode": "json"},
+            rate_key="pubmed",
+            rate_limit=3.0,
+        )
+        results = summary_data.get("result", {})
+        for pmid in id_list:
+            article = results.get(pmid, {})
+            if not article or pmid == "uids":
+                continue
+            title = article.get("title", "")
+            authors = ", ".join(a.get("name", "") for a in article.get("authors", [])[:3])
+            pub_date = article.get("pubdate", "")
+            source = article.get("source", "")
+            metadata = {
+                "conference": conference,
+                "via": "PubMed",
+                "pmid": pmid,
+                "source_url": source_url,
+            }
+            if primary_error:
+                metadata["primary_source_failed"] = True
+                metadata["primary_source_error"] = primary_error[:240]
+            items.append({
+                "title": title,
+                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                "content": f"Authors: {authors}. Source: {source}".strip(),
+                "published_at": pub_date,
+                "metadata": metadata,
+            })
+    except Exception as exc:
+        items.append({
+            "title": f"[{conference} search error: {exc}]",
+            "url": source_url,
+            "content": str(exc),
+            "published_at": "",
+            "metadata": {"conference": conference, "error": True},
+        })
+    return items
+
+
 # ---------------------------------------------------------------------------
 # ESMO (esmo.org)
 # ---------------------------------------------------------------------------
 
 async def _search_esmo(query: str, max_results: int) -> list[dict]:
-    """Search ESMO oncology abstracts / meeting resources."""
-    items: list[dict] = []
-    url = f"https://www.esmo.org/search?q={quote(query)}"
-    try:
-        html = await fetch_text(url, rate_key=RATE_KEY, rate_limit=2.0, timeout=20)
-        soup = parse_html(html)
+    """Search ESMO meeting resources.
 
-        for result in soup.select("div.search-result, li.search-item, div.result-item")[:max_results]:
-            link = result.find("a")
-            if not link:
-                continue
+    `sources.md` points to the public meeting calendar, which is better suited to
+    event discovery than free-text abstract search. We therefore:
+    1. Try the official meeting calendar for query hits
+    2. Fall back to PubMed (`Ann Oncol` / ESMO mentions) for topic search
+    """
+    items: list[dict] = []
+    url = "https://www.esmo.org/meeting-calendar"
+    primary_error: str | None = None
+    try:
+        html = await fetch_text_auto(
+            url,
+            rate_key=RATE_KEY,
+            rate_limit=2.0,
+            timeout=12,
+            max_retries=1,
+        )
+        soup = parse_html(html)
+        q_lower = query.lower()
+        for link in soup.select("a[href]"):
             title = extract_text(link)
             href = link.get("href", "")
+            if not title or len(title) < 6:
+                continue
+            if q_lower not in title.lower():
+                continue
             if href and not href.startswith("http"):
                 href = f"https://www.esmo.org{href}"
-
-            snippet_el = result.find(class_="snippet") or result.find("p")
-            snippet = extract_text(snippet_el) if snippet_el else ""
-
             items.append({
                 "title": title,
                 "url": href,
-                "content": snippet,
+                "content": "Matched from official ESMO meeting calendar.",
                 "published_at": "",
-                "metadata": {"conference": "ESMO"},
+                "metadata": {"conference": "ESMO", "source_type": "meeting_calendar"},
             })
+            if len(items) >= max_results:
+                break
     except Exception as exc:
-        items.append({
-            "title": f"[ESMO search error: {exc}]",
-            "url": url,
-            "content": str(exc),
-            "published_at": "",
-            "metadata": {"conference": "ESMO", "error": True},
-        })
+        primary_error = str(exc)
+
+    if not items:
+        items = await _search_pubmed_conference_fallback(
+            query,
+            max_results,
+            conference="ESMO",
+            pubmed_query=f'{query} AND ("ESMO"[All Fields] OR "Ann Oncol"[Journal])',
+            source_url=url,
+            primary_error=primary_error,
+        )
     return items
 
 
