@@ -3,7 +3,7 @@
 
 Usage:
     python scripts/orchestrator.py benchmark   # run benchmarks, create issues on failure
-    python scripts/orchestrator.py fix         # pick up open issues, claude-fix in worktrees
+    python scripts/orchestrator.py fix         # pick up open issues, agent-fix in worktrees
     python scripts/orchestrator.py loop        # full cycle: benchmark then fix
 """
 
@@ -32,8 +32,33 @@ BENCHMARK_LABEL = "benchmark-failure"
 CLAUDE_MAX_TURNS = 20
 CLAUDE_MAX_BUDGET_USD = 5
 MAX_FIX_ATTEMPTS = 3
+BACKEND_AUTO = "auto"
+BACKEND_CLAUDE = "claude"
+BACKEND_CODEX = "codex"
+SUPPORTED_BACKENDS = (BACKEND_CLAUDE, BACKEND_CODEX)
+BACKEND_ALIASES = {
+    BACKEND_AUTO: BACKEND_AUTO,
+    BACKEND_CLAUDE: BACKEND_CLAUDE,
+    "claude-code": BACKEND_CLAUDE,
+    "claude_code": BACKEND_CLAUDE,
+    BACKEND_CODEX: BACKEND_CODEX,
+}
+BACKEND_ENV_VARS = {
+    BACKEND_CLAUDE: "CIDECTOR_CLAUDE_BIN",
+    BACKEND_CODEX: "CIDECTOR_CODEX_BIN",
+}
+BACKEND_FALLBACK_PATHS = {
+    BACKEND_CLAUDE: [],
+    BACKEND_CODEX: [
+        "/Applications/Codex.app/Contents/Resources/codex",
+    ],
+}
 
-_config: dict = {"max_issues": 5, "max_fix_attempts": MAX_FIX_ATTEMPTS}
+_config: dict = {
+    "max_issues": 5,
+    "max_fix_attempts": MAX_FIX_ATTEMPTS,
+    "backend": os.getenv("CIDECTOR_AGENT_BACKEND", BACKEND_AUTO),
+}
 
 logger = logging.getLogger("orchestrator")
 
@@ -99,7 +124,7 @@ def _gh_available() -> bool:
 def _ensure_labels_exist() -> None:
     """Create the required labels if they don't already exist in the repo."""
     labels = {
-        ISSUE_LABEL: {"description": "Auto-fix target for Claude", "color": "d876e3"},
+        ISSUE_LABEL: {"description": "Auto-fix target for coding agent backends", "color": "d876e3"},
         BENCHMARK_LABEL: {"description": "Benchmark test failure", "color": "e11d48"},
     }
     for name, meta in labels.items():
@@ -124,8 +149,75 @@ def _ensure_labels_exist() -> None:
             logger.info("Created label: %s", name)
 
 
-def _claude_available() -> bool:
-    return shutil.which("claude") is not None
+def _normalize_backend(backend: str) -> str:
+    normalized = BACKEND_ALIASES.get((backend or "").strip().lower())
+    if not normalized:
+        allowed = ", ".join([BACKEND_AUTO, *SUPPORTED_BACKENDS])
+        raise ValueError(f"Unsupported backend '{backend}'. Expected one of: {allowed}")
+    return normalized
+
+
+def _backend_display_name(backend: str) -> str:
+    if backend == BACKEND_CLAUDE:
+        return "Claude Code CLI"
+    if backend == BACKEND_CODEX:
+        return "Codex CLI"
+    if backend == BACKEND_AUTO:
+        return "auto"
+    return backend
+
+
+def _backend_available(backend: str) -> bool:
+    return _get_backend_executable(backend) is not None
+
+
+def _get_backend_executable(backend: str) -> str | None:
+    env_var = BACKEND_ENV_VARS.get(backend)
+    if env_var:
+        configured = os.getenv(env_var)
+        if configured and Path(configured).exists():
+            return configured
+
+    executable = BACKEND_CLAUDE if backend == BACKEND_CLAUDE else BACKEND_CODEX
+    resolved = shutil.which(executable)
+    if resolved:
+        return resolved
+
+    for candidate in BACKEND_FALLBACK_PATHS.get(backend, []):
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _resolve_backend(preferred: str) -> str | None:
+    backend = _normalize_backend(preferred)
+    if backend != BACKEND_AUTO:
+        return backend if _backend_available(backend) else None
+    for candidate in SUPPORTED_BACKENDS:
+        if _backend_available(candidate):
+            return candidate
+    return None
+
+
+def _build_agent_command(backend: str, prompt: str) -> list[str]:
+    executable = _get_backend_executable(backend)
+    if not executable:
+        raise ValueError(f"Backend executable not found for: {backend}")
+    if backend == BACKEND_CLAUDE:
+        return [
+            executable, "-p", prompt,
+            "--allowedTools", "Read,Edit,Write,Bash",
+            "--max-turns", str(CLAUDE_MAX_TURNS),
+        ]
+    if backend == BACKEND_CODEX:
+        return [
+            executable,
+            "-a", "never",
+            "exec",
+            "--sandbox", "workspace-write",
+            prompt,
+        ]
+    raise ValueError(f"Unsupported backend: {backend}")
 
 
 def _save_benchmark_report(report: dict) -> Path:
@@ -322,7 +414,7 @@ def _verify_fix(worktree_path: Path, case_name: str | None) -> bool:
 
 
 def _collect_git_attempt_summary(worktree_path: Path, base_ref: str) -> dict:
-    """Summarize repo changes vs baseline after Claude (for issue comments)."""
+    """Summarize repo changes vs baseline after an agent run (for issue comments)."""
     stat = _run(
         ["git", "diff", "--stat", base_ref],
         cwd=str(worktree_path), check=False,
@@ -345,18 +437,20 @@ def _collect_git_attempt_summary(worktree_path: Path, base_ref: str) -> dict:
     }
 
 
-def _format_claude_transcript_for_issue(
+def _format_agent_transcript_for_issue(
     stdout: str | None,
     stderr: str | None,
     *,
+    backend: str,
     head_chars: int = 3200,
     tail_chars: int = 3200,
     stderr_max: int = 2800,
 ) -> str:
-    """Readable Claude CLI transcript: stderr + stdout head/tail (agent 'direction')."""
+    """Readable agent transcript: stderr + stdout head/tail."""
     blocks: list[str] = []
     out = (stdout or "").strip()
     err = (stderr or "").strip()
+    agent_name = _backend_display_name(backend)
 
     if "Reached max turns" in out or "Reached max turns" in err:
         blocks.append(
@@ -367,23 +461,23 @@ def _format_claude_transcript_for_issue(
 
     if err:
         e = err if len(err) <= stderr_max else ("…" + err[-stderr_max:])
-        blocks.append("**Claude stderr**（若有）:\n```\n" + e + "\n```")
+        blocks.append(f"**{agent_name} stderr**（若有）:\n```\n" + e + "\n```")
 
     if not out:
-        blocks.append("**Claude stdout**: *(空)*")
+        blocks.append(f"**{agent_name} stdout**: *(空)*")
         return "\n\n".join(blocks)
 
     if len(out) <= head_chars + tail_chars + 80:
-        blocks.append("**Claude stdout**（全文）:\n```\n" + out + "\n```")
+        blocks.append(f"**{agent_name} stdout**（全文）:\n```\n" + out + "\n```")
     else:
         h = out[:head_chars]
         t = out[-tail_chars:]
         blocks.append(
-            "**Claude stdout**（**首部** — 往往含计划与早期工具调用）:\n```\n"
+            f"**{agent_name} stdout**（**首部** — 往往含计划与早期工具调用）:\n```\n"
             + h + "\n```"
         )
         blocks.append(
-            "**Claude stdout**（**尾部** — 往往含最后几步与报错）:\n```\n"
+            f"**{agent_name} stdout**（**尾部** — 往往含最后几步与报错）:\n```\n"
             + t + "\n```"
         )
     return "\n\n".join(blocks)
@@ -467,9 +561,11 @@ def _format_git_attempt_markdown(g: dict) -> str:
 def _compact_attempt_retry_summary(
     verification: dict,
     git_summary: dict,
-    claude_exit: int,
+    agent_exit: int,
     stdout: str,
     stderr: str,
+    *,
+    backend: str,
     max_len: int = 800,
 ) -> str:
     """Short line for build_fix_prompt RETRY CONTEXT (must stay small)."""
@@ -491,11 +587,11 @@ def _compact_attempt_retry_summary(
         chunks.append("验证: stdout 非 JSON 或解析失败")
     fl = git_summary.get("files") or []
     chunks.append(f"改动文件: {', '.join(fl[:6]) or '无'}")
-    if claude_exit != 0:
-        chunks.append(f"claude_exit={claude_exit}")
+    if agent_exit != 0:
+        chunks.append(f"{backend}_exit={agent_exit}")
     blob = (stdout or "") + (stderr or "")
     if "Reached max turns" in blob:
-        chunks.append("Claude 达 max-turns 未结束")
+        chunks.append(f"{_backend_display_name(backend)} 达 max-turns 未结束")
     text = " | ".join(chunks)
     return text if len(text) <= max_len else text[: max_len - 1] + "…"
 
@@ -510,7 +606,8 @@ def cmd_benchmark() -> dict:
 
     result = subprocess.run(
         [sys.executable, str(BENCHMARK_RUNNER), "--verbose"],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=None,
         text=True,
         cwd=str(PROJECT_ROOT),
     )
@@ -520,7 +617,6 @@ def cmd_benchmark() -> dict:
     except (json.JSONDecodeError, ValueError):
         logger.error("Failed to parse benchmark output as JSON")
         logger.error("stdout: %s", result.stdout[:500])
-        logger.error("stderr: %s", result.stderr[:500])
         sys.exit(1)
 
     _save_benchmark_report(report)
@@ -625,7 +721,7 @@ def _fix_issue(issue: dict) -> bool:
     -----------------
     1. **Resolved, no code changes** — benchmark passes without any diff.
        → Comment findings on issue, close it.
-    2. **Resolved, has code changes** — benchmark passes after Claude edits.
+    2. **Resolved, has code changes** — benchmark passes after agent edits.
        → Commit, push branch, create PR (which auto-closes the issue).
     3. **Unresolved after N attempts** — benchmark still fails.
        → Comment failure summary on issue, leave it open for human review.
@@ -638,6 +734,8 @@ def _fix_issue(issue: dict) -> bool:
     branch = f"fix/issue-{number}"
     worktree_path = WORKTREES_DIR / branch.replace("/", "-")
     max_attempts = _config["max_fix_attempts"]
+    backend = _config["backend"]
+    agent_name = _backend_display_name(backend)
 
     logger.info("--- Fixing issue #%d: %s ---", number, title)
 
@@ -686,7 +784,8 @@ def _fix_issue(issue: dict) -> bool:
 
             # ----- Preflight: if the target benchmark already passes on the
             # current baseline, do not attribute the resolution to a new agent run.
-            logger.info("Preflight benchmark check before launching Claude (case=%s) …",
+            logger.info("Preflight benchmark check before launching %s (case=%s) …",
+                        agent_name,
                         case_name or "ALL")
             preflight_passed, preflight_details = _verify_fix_with_details(
                 worktree_path, case_name)
@@ -697,13 +796,14 @@ def _fix_issue(issue: dict) -> bool:
                     number,
                     case_name=case_name,
                     verification_details=preflight_details,
-                    claude_output="",
-                    claude_exit_code=None,
+                    agent_output="",
+                    agent_exit_code=None,
+                    backend=backend,
                     preflight=True,
                 )
                 return True
 
-            # ----- Run Claude -----
+            # ----- Run agent -----
             from orchestrate.prompts.fix_prompt import build_fix_prompt
             prompt = build_fix_prompt(
                 number, title, body,
@@ -712,30 +812,26 @@ def _fix_issue(issue: dict) -> bool:
                 previous_attempts=attempt_history if attempt > 1 else None,
             )
 
-            logger.info("Launching Claude CLI (attempt %d) in worktree %s",
-                         attempt, worktree_path)
-            claude_result = _run(
-                [
-                    "claude", "-p", prompt,
-                    "--allowedTools", "Read,Edit,Write,Bash",
-                    "--max-turns", str(CLAUDE_MAX_TURNS),
-                ],
+            logger.info("Launching %s (attempt %d) in worktree %s",
+                         agent_name, attempt, worktree_path)
+            agent_result = _run(
+                _build_agent_command(backend, prompt),
                 cwd=str(worktree_path),
                 check=False,
             )
-            claude_output = (claude_result.stdout or "").strip()
+            agent_output = (agent_result.stdout or "").strip()
 
-            if claude_result.returncode != 0:
-                logger.warning("Claude exited with code %d (attempt %d)",
-                               claude_result.returncode, attempt)
+            if agent_result.returncode != 0:
+                logger.warning("%s exited with code %d (attempt %d)",
+                               agent_name, agent_result.returncode, attempt)
 
             # ----- Stage changes (but don't commit yet) -----
             _run(["git", "add", "-A"], cwd=str(worktree_path), check=False)
             diff_result = _run(["git", "diff", "--cached", "--quiet"],
                                cwd=str(worktree_path), check=False)
             has_staged = diff_result.returncode != 0
-            has_claude_commits = _branch_has_new_commits(worktree_path)
-            has_code_changes = has_staged or has_claude_commits
+            has_agent_commits = _branch_has_new_commits(worktree_path)
+            has_code_changes = has_staged or has_agent_commits
 
             # ----- Verify BEFORE committing -----
             logger.info("Verifying fix with benchmark (case=%s) …", case_name or "ALL")
@@ -762,31 +858,34 @@ def _fix_issue(issue: dict) -> bool:
                     number,
                     case_name=case_name,
                     verification_details=verification_details,
-                    claude_output=claude_output,
-                    claude_exit_code=claude_result.returncode,
+                    agent_output=agent_output,
+                    agent_exit_code=agent_result.returncode,
+                    backend=backend,
                     preflight=False,
                 )
                 return True
 
             # ----- Not resolved — record and retry -----
             git_summary = _collect_git_attempt_summary(worktree_path, base_ref)
-            raw_out = claude_result.stdout or ""
-            raw_err = claude_result.stderr or ""
+            raw_out = agent_result.stdout or ""
+            raw_err = agent_result.stderr or ""
             attempt_history.append({
                 "attempt": attempt,
                 "had_code_changes": has_code_changes,
-                "claude_exit_code": claude_result.returncode,
+                "backend": backend,
+                "agent_exit_code": agent_result.returncode,
                 "summary": _compact_attempt_retry_summary(
                     verification_details,
                     git_summary,
-                    claude_result.returncode,
+                    agent_result.returncode,
                     raw_out,
                     raw_err,
+                    backend=backend,
                 ),
                 "verification": verification_details,
                 "git": git_summary,
-                "claude_stdout": raw_out,
-                "claude_stderr": raw_err,
+                "agent_stdout": raw_out,
+                "agent_stderr": raw_err,
             })
             logger.warning("Attempt %d/%d failed for issue #%d — benchmark still failing",
                            attempt, max_attempts, number)
@@ -846,10 +945,11 @@ def _push_and_create_pr(
         logger.error("Failed to push branch %s: %s", branch, push_result.stderr)
         return False
 
+    agent_name = _backend_display_name(_config["backend"])
     pr_body = f"Closes #{number}\n\n"
     if commit_summary:
         pr_body += f"## Changes\n\n{commit_summary}\n\n"
-    pr_body += "*Auto-generated fix by Claude Code via `orchestrate/orchestrator.py`.*"
+    pr_body += f"*Auto-generated fix by {agent_name} via `orchestrate/orchestrator.py`.*"
 
     pr_result = _run(
         [
@@ -873,8 +973,9 @@ def _comment_and_close_issue(
     *,
     case_name: str | None,
     verification_details: dict,
-    claude_output: str,
-    claude_exit_code: int | None,
+    agent_output: str,
+    agent_exit_code: int | None,
+    backend: str,
     preflight: bool,
 ) -> None:
     """Close an issue when benchmark passes without new repo code changes.
@@ -912,17 +1013,19 @@ def _comment_and_close_issue(
             "",
             f"- **目标 case**: `{case_name}`",
         ])
-    if claude_exit_code is not None:
+    agent_name = _backend_display_name(backend)
+    if agent_exit_code is not None:
         sections.extend([
-            f"- **修复代理退出码**: `{claude_exit_code}`",
+            f"- **修复代理退出码**: `{agent_exit_code}`",
         ])
 
-    trimmed_output = (claude_output or "").strip()
+    trimmed_output = (agent_output or "").strip()
     if trimmed_output:
         max_len = 12000
-        transcript = _format_claude_transcript_for_issue(
+        transcript = _format_agent_transcript_for_issue(
             trimmed_output,
             "",
+            backend=backend,
             head_chars=2400,
             tail_chars=2400,
             stderr_max=2000,
@@ -931,7 +1034,7 @@ def _comment_and_close_issue(
             transcript = transcript[:max_len] + "\n\n… *(代理输出过长已截断)*"
         sections.extend([
             "",
-            "### 代理输出（供参考）",
+            f"### 代理输出（{agent_name}，供参考）",
             "",
             transcript,
         ])
@@ -961,6 +1064,7 @@ def _format_fix_methodology_markdown(
     branch: str,
 ) -> str:
     """Human-readable description of what `fix` actually did (for issue comments)."""
+    backend = _config["backend"]
     verify_cmd = (
         f"`python benchmarks/run_benchmarks.py --verbose --filter {case_name}`"
         if case_name
@@ -977,10 +1081,9 @@ def _format_fix_methodology_markdown(
         "| 环节 | 做法 |\n"
         "|------|------|\n"
         f"| 工作副本 | 独立 `git worktree`，分支 `{branch}`；每轮重试前 `git reset --hard` + `git clean -fd` 恢复基线 |\n"
-        "| 修复代理 | **Claude Code CLI**：非交互 `-p` 提示词 + "
-        f"`--allowedTools Read,Edit,Write,Bash` + `--max-turns {CLAUDE_MAX_TURNS}` |\n"
-        "| 单次对话 | 每轮最多 **{CLAUDE_MAX_TURNS}** 个 agent turns；若日志出现 "
-        "`Reached max turns`，表示在该轮内对话预算用尽（非 orchestrator 重试次数） |\n"
+        f"| 修复代理 | **{_backend_display_name(backend)}**（由 `--backend` / `CIDECTOR_AGENT_BACKEND` 选择） |\n"
+        f"| 单次对话 | Claude backend 会附加 `--max-turns {CLAUDE_MAX_TURNS}`；Codex backend 走 `codex exec --sandbox workspace-write`。若日志出现 "
+        "`Reached max turns`，表示该轮对话预算用尽（非 orchestrator 重试次数） |\n"
         f"| 验证 | worktree 内执行 {verify_cmd}，解析 stdout JSON；"
         "须判定目标 case 为 `PASS`（或全量时 `failed == 0`）才算修复成功 |\n"
         f"| 重试 | orchestrator 层最多 **{max_attempts}** 轮；每轮为新进程，"
@@ -1010,16 +1113,19 @@ def _comment_unresolved(
     attempt_sections: list[str] = []
     for rec in attempts:
         code_tag = "有代码改动（benchmark 仍未通过）" if rec["had_code_changes"] else "无代码改动"
-        exit_code = rec.get("claude_exit_code")
+        backend = rec.get("backend", _config["backend"])
+        agent_name = _backend_display_name(backend)
+        exit_code = rec.get("agent_exit_code")
         exit_line = (
-            f"- **Claude 进程退出码**: `{exit_code}`\n"
+            f"- **{agent_name} 进程退出码**: `{exit_code}`\n"
             if exit_code is not None
             else ""
         )
         if rec.get("verification") is not None and rec.get("git") is not None:
-            transcript = _format_claude_transcript_for_issue(
-                rec.get("claude_stdout"),
-                rec.get("claude_stderr"),
+            transcript = _format_agent_transcript_for_issue(
+                rec.get("agent_stdout"),
+                rec.get("agent_stderr"),
+                backend=backend,
                 head_chars=2600,
                 tail_chars=2600,
                 stderr_max=2400,
@@ -1032,7 +1138,7 @@ def _comment_unresolved(
                 f"{exit_line}\n"
                 f"{_format_verification_markdown(rec['verification'])}\n\n"
                 f"{_format_git_attempt_markdown(rec['git'])}\n\n"
-                f"##### 代理侧（Claude CLI）\n{transcript}"
+                f"##### 代理侧（{agent_name}）\n{transcript}"
             )
         else:
             summary = (rec.get("summary") or "")[:1200]
@@ -1086,9 +1192,16 @@ def cmd_fix() -> None:
         logger.error("gh CLI not available or not authenticated — cannot list issues")
         sys.exit(1)
 
-    if not _claude_available():
-        logger.error("claude CLI not found in PATH — cannot fix issues")
+    resolved_backend = _resolve_backend(_config["backend"])
+    if not resolved_backend:
+        requested = _normalize_backend(_config["backend"])
+        if requested == BACKEND_AUTO:
+            logger.error("Neither claude nor codex CLI was found in PATH — cannot fix issues")
+        else:
+            logger.error("%s not found in PATH — cannot fix issues", requested)
         sys.exit(1)
+    _config["backend"] = resolved_backend
+    logger.info("Using backend: %s", _backend_display_name(resolved_backend))
 
     issues = _get_open_issues()
     if not issues:
@@ -1154,7 +1267,7 @@ def main() -> None:
         epilog=textwrap.dedent("""\
             sub-commands:
               benchmark   Run benchmark suite; create GitHub issue on failure
-              fix         Pick up open claude-fix issues; fix with Claude CLI in worktrees
+              fix         Pick up open claude-fix issues; fix with selected agent backend
               loop        Full cycle: benchmark then fix
         """),
     )
@@ -1175,10 +1288,23 @@ def main() -> None:
         "--max-attempts", type=int, default=_config["max_fix_attempts"],
         help=f"Max fix attempts per issue before giving up (default: {_config['max_fix_attempts']})",
     )
+    parser.add_argument(
+        "--backend",
+        choices=[BACKEND_AUTO, *SUPPORTED_BACKENDS],
+        default=_config["backend"],
+        help=(
+            "Agent backend to use for fix mode "
+            f"(default: {_config['backend']}; env: CIDECTOR_AGENT_BACKEND)"
+        ),
+    )
     args = parser.parse_args()
 
     _config["max_issues"] = args.max_issues
     _config["max_fix_attempts"] = args.max_attempts
+    try:
+        _config["backend"] = _normalize_backend(args.backend)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     _setup_logging(args.verbose)
 

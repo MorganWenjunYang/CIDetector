@@ -2,6 +2,10 @@
 
 多源数据采集与分析工具集，专为生物医药竞争情报研究设计。覆盖 ClinicalTrials.gov、PubMed、中国 CDE、Tavily 网页搜索、学术会议摘要、资本市场公告等数据源。
 
+支持两类 coding-agent backend：
+- `Claude Code`
+- `Codex`
+
 ## 功能
 
 - **临床试验搜索** — ClinicalTrials.gov REST API v2
@@ -15,7 +19,7 @@
 
 ## 安装方式
 
-### 方式一：Claude Code Plugin（推荐）
+### 方式一：Claude Code Plugin
 
 在 Claude Code 终端中运行：
 
@@ -42,7 +46,7 @@ vim ~/.claude/plugins/installed/cidector/.env
 /fact-check Farxiga 2024年销售额77亿美元
 ```
 
-### 方式二：Git Clone 本地使用
+### 方式二：Git Clone 本地使用（Codex / Claude Code）
 
 ```bash
 git clone https://github.com/yourname/CIDector.git
@@ -57,6 +61,23 @@ cp .env.example .env
 ```bash
 cd CIDector
 claude
+```
+
+在项目目录下启动 Codex，`AGENTS.md` 会自动加载：
+
+```bash
+cd CIDector
+codex
+```
+
+如果你使用自动修复 orchestrator，可以显式选择 backend：
+
+```bash
+python3 orchestrate/orchestrator.py fix --backend claude
+python3 orchestrate/orchestrator.py fix --backend codex
+
+# 或通过环境变量设置默认 backend
+CIDECTOR_AGENT_BACKEND=codex python3 orchestrate/orchestrator.py loop
 ```
 
 ## 环境变量
@@ -75,6 +96,7 @@ claude
 CIDector/
 ├── .claude-plugin/
 │   └── plugin.json            # Claude Code 插件元数据
+├── AGENTS.md                  # Codex 用项目指令
 ├── skills/
 │   ├── cidector/
 │   │   └── SKILL.md           # 主 skill（自动触发）
@@ -98,7 +120,7 @@ CIDector/
 │   ├── cache.py               # SQLite 缓存
 │   └── parsers.py             # 解析工具
 ├── reports/                   # 生成的报告输出目录
-├── CLAUDE.md                  # 本地开发用 system prompt
+├── CLAUDE.md                  # Claude Code 用项目指令
 ├── setup.sh                   # 一键安装脚本
 ├── requirements.txt           # Python 依赖
 └── .env.example               # 环境变量模板

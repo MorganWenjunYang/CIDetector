@@ -1,6 +1,6 @@
-"""Prompt template for the Claude fixing agent.
+"""Prompt template for the fixing agent.
 
-This prompt is injected via `claude -p` when the orchestrator dispatches a
+This prompt is injected when the orchestrator dispatches a
 fix task to a worktree. It must give the agent a complete mental model of:
 
 1. The project architecture (what this codebase does)
@@ -66,7 +66,7 @@ def build_fix_prompt(
     max_attempts: int = 10,
     previous_attempts: list[dict] | None = None,
 ) -> str:
-    """Build the full prompt for Claude to fix a single issue.
+    """Build the full prompt for the selected backend to fix a single issue.
 
     This prompt is designed to be self-contained — the fixing agent runs in an
     isolated worktree and has no prior context.
@@ -84,8 +84,10 @@ def build_fix_prompt(
         STEP 0: READ PROJECT CONTEXT
         ═══════════════════════════════════════════════════════
 
-        Run: cat CLAUDE.md
-        This file describes the full project architecture, tool interfaces, and conventions.
+        Read the repository instruction files first:
+        - `AGENTS.md` (preferred when present)
+        - `CLAUDE.md` (also present in this repo for Claude Code compatibility)
+        These files describe the full project architecture, tool interfaces, and conventions.
         {attempt_ctx}
         ═══════════════════════════════════════════════════════
         STEP 1: UNDERSTAND THE ISSUE
