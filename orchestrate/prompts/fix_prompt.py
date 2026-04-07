@@ -236,4 +236,12 @@ def build_fix_prompt(
         - Do NOT add broad try/except that silently swallows errors
         - If you install a pip package, also check if it's in requirements.txt
           and add it if missing — this IS a code change worth committing
+        - Do NOT modify any file under these LOCKED paths (the orchestrator
+          will reject your changes automatically if you do):
+            - benchmarks/          (benchmark specs & runner)
+            - orchestrate/prompts/ (issue/fix prompt templates)
+            - orchestrate/orchestrator.py (the orchestrator itself)
+            - .env, .env.example   (environment config)
+            - benchmark_cases.yaml (test case definitions)
+            - .claude-plugin/      (plugin metadata)
     """)

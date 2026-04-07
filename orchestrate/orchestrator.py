@@ -5,6 +5,7 @@ Usage:
     python scripts/orchestrator.py benchmark   # run benchmarks, create issues on failure
     python scripts/orchestrator.py fix         # pick up open issues, agent-fix in worktrees
     python scripts/orchestrator.py loop        # full cycle: benchmark then fix
+    python scripts/orchestrator.py daemon      # continuous loop with configurable interval
 """
 
 from __future__ import annotations
@@ -14,10 +15,12 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
 import textwrap
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,10 +57,62 @@ BACKEND_FALLBACK_PATHS = {
     ],
 }
 
+# ---------------------------------------------------------------------------
+# Safety & quality constants (ported from autoevolve patterns)
+# ---------------------------------------------------------------------------
+
+# F1: Locked paths — agent must not modify these; enforced at code level
+LOCKED_PATHS = (
+    "benchmarks/",
+    "orchestrate/prompts/",
+    "orchestrate/orchestrator.py",
+    ".env",
+    ".env.example",
+    "benchmark_cases.yaml",
+    ".claude-plugin/",
+)
+
+# F3: Baseline report for zero-regression checks
+BASELINE_REPORT_PATH = LOGS_DIR / "baseline_benchmark.json"
+
+# F4: Quarantine — persistent failure tracking
+QUARANTINE_FILE = LOGS_DIR / "quarantine.json"
+MAX_QUARANTINE_ATTEMPTS = 3
+
+# F5: Bucketed priority for case selection (lower = higher priority)
+PRIORITY_BUCKETS = {
+    "api_regression": 10,       # API-backed tools: ClinicalTrials.gov, PubMed
+    "scraper_breakage": 20,     # HTML scrapers: China trials, conferences, stock, RSS
+    "search_degradation": 30,   # Web search tools (Tavily-based)
+    "network_transient": 40,    # Timeouts, connection errors
+    "config_or_env": 50,        # Missing env vars, config issues
+}
+
+_TOOL_BUCKET_MAP = {
+    "tools/search_clinical_trials.py": "api_regression",
+    "tools/search_pubmed.py": "api_regression",
+    "tools/web_search.py": "search_degradation",
+    "tools/search_china_trials.py": "scraper_breakage",
+    "tools/search_conferences.py": "scraper_breakage",
+    "tools/search_stock_disclosure.py": "scraper_breakage",
+    "tools/rss_monitor.py": "scraper_breakage",
+    "tools/fetch_page.py": "scraper_breakage",
+}
+
+_ERROR_BUCKET_OVERRIDES = {
+    "http_403_forbidden": "scraper_breakage",
+    "antibot_challenge": "scraper_breakage",
+    "timeout": "network_transient",
+}
+
+# F6: Daemon status file
+DAEMON_STATUS_FILE = LOGS_DIR / "daemon_status.json"
+
 _config: dict = {
     "max_issues": 5,
     "max_fix_attempts": MAX_FIX_ATTEMPTS,
     "backend": os.getenv("CIDECTOR_AGENT_BACKEND", BACKEND_AUTO),
+    "skip_regression_check": False,
 }
 
 logger = logging.getLogger("orchestrator")
@@ -231,28 +286,321 @@ def _save_benchmark_report(report: dict) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# F1: Locked-paths validation
+# ---------------------------------------------------------------------------
+
+def _validate_changed_files(worktree_path: Path) -> list[str]:
+    """Return changed files that touch locked paths.  Empty list = all OK."""
+    staged = _run(
+        ["git", "diff", "--cached", "--name-only"],
+        cwd=str(worktree_path), check=False,
+    )
+    unstaged = _run(
+        ["git", "diff", "--name-only"],
+        cwd=str(worktree_path), check=False,
+    )
+    all_files: set[str] = set()
+    for line in (staged.stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            all_files.add(stripped)
+    for line in (unstaged.stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            all_files.add(stripped)
+
+    forbidden: list[str] = []
+    for f in sorted(all_files):
+        normalized = f.replace("\\", "/").lstrip("./")
+        for locked in LOCKED_PATHS:
+            locked_norm = locked.replace("\\", "/").lstrip("./")
+            if normalized == locked_norm or normalized.startswith(locked_norm):
+                forbidden.append(f)
+                break
+    return forbidden
+
+
+# ---------------------------------------------------------------------------
+# F2: Quick gate (fast sanity check before expensive benchmark)
+# ---------------------------------------------------------------------------
+
+def _run_quick_gate(worktree_path: Path) -> tuple[bool, dict]:
+    """Fast sanity check: core imports + YAML validity.
+
+    Returns (passed, details_dict).
+    """
+    details: dict = {"checks": [], "passed": False}
+
+    # Check 1: core Python imports
+    import_code = (
+        "import sys; sys.path.insert(0, '.'); "
+        "import tools; import utils; "
+        "from utils import http_client, parsers; "
+        "print('imports_ok')"
+    )
+    result = _run(
+        [sys.executable, "-c", import_code],
+        cwd=str(worktree_path), check=False, timeout=30.0,
+    )
+    import_ok = result.returncode == 0 and "imports_ok" in (result.stdout or "")
+    details["checks"].append({
+        "name": "core_imports",
+        "passed": import_ok,
+        "error": (result.stderr or "").strip()[:500] if not import_ok else None,
+    })
+    if not import_ok:
+        logger.warning("Quick gate FAILED: core imports broken")
+        return False, details
+
+    # Check 2: benchmark_cases.yaml validity
+    yaml_code = (
+        "import yaml, json, sys; "
+        "data = yaml.safe_load(open('benchmarks/benchmark_cases.yaml')); "
+        "assert isinstance(data, dict) and 'cases' in data, 'missing cases key'; "
+        "assert isinstance(data['cases'], list) and len(data['cases']) > 0, 'empty cases'; "
+        "print(json.dumps({'case_count': len(data['cases'])}))"
+    )
+    result = _run(
+        [sys.executable, "-c", yaml_code],
+        cwd=str(worktree_path), check=False, timeout=15.0,
+    )
+    yaml_ok = result.returncode == 0
+    details["checks"].append({
+        "name": "benchmark_yaml_valid",
+        "passed": yaml_ok,
+        "error": (result.stderr or "").strip()[:500] if not yaml_ok else None,
+    })
+    if not yaml_ok:
+        logger.warning("Quick gate FAILED: benchmark_cases.yaml invalid")
+        return False, details
+
+    details["passed"] = True
+    return True, details
+
+
+# ---------------------------------------------------------------------------
+# F3: Baseline management & zero-regression check
+# ---------------------------------------------------------------------------
+
+def _load_baseline_report() -> dict | None:
+    """Load the most recent baseline benchmark report, or None."""
+    if BASELINE_REPORT_PATH.exists():
+        try:
+            with open(BASELINE_REPORT_PATH, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            logger.warning("Could not load baseline from %s", BASELINE_REPORT_PATH)
+    return None
+
+
+def _save_baseline_report(report: dict) -> None:
+    """Persist benchmark report as the new baseline for regression checks."""
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(BASELINE_REPORT_PATH, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    logger.info("Saved baseline report to %s", BASELINE_REPORT_PATH)
+
+
+def _check_zero_regression(
+    worktree_path: Path,
+    baseline: dict,
+) -> tuple[bool, dict]:
+    """Run full benchmark suite and compare against *baseline*.
+
+    Returns (no_regression, details) where details contains regressions
+    and improvements lists.
+    """
+    runner = worktree_path / "benchmarks" / "run_benchmarks.py"
+    cmd = [sys.executable, str(runner), "--verbose"]
+
+    details: dict = {
+        "baseline_passed": baseline.get("passed", 0),
+        "baseline_failed": baseline.get("failed", 0),
+        "candidate_passed": 0,
+        "candidate_failed": 0,
+        "regressions": [],
+        "improvements": [],
+        "no_regression": False,
+    }
+
+    result = subprocess.run(
+        cmd, capture_output=True, text=True,
+        timeout=300,
+        cwd=str(worktree_path),
+    )
+
+    try:
+        candidate = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        details["error"] = "Could not parse full benchmark output"
+        return False, details
+
+    details["candidate_passed"] = candidate.get("passed", 0)
+    details["candidate_failed"] = candidate.get("failed", 0)
+
+    baseline_by_name = {r["name"]: r for r in baseline.get("results", [])}
+    candidate_by_name = {r["name"]: r for r in candidate.get("results", [])}
+
+    for name, base_r in baseline_by_name.items():
+        cand_r = candidate_by_name.get(name)
+        if cand_r is None:
+            continue
+        if base_r["status"] == "PASS" and cand_r["status"] in ("FAIL", "WARN"):
+            details["regressions"].append({
+                "name": name,
+                "was": base_r["status"],
+                "now": cand_r["status"],
+                "error": (cand_r.get("error") or "")[:200],
+            })
+        elif base_r["status"] in ("FAIL", "WARN") and cand_r["status"] == "PASS":
+            details["improvements"].append({
+                "name": name,
+                "was": base_r["status"],
+                "now": cand_r["status"],
+            })
+
+    details["no_regression"] = len(details["regressions"]) == 0
+    return details["no_regression"], details
+
+
+# ---------------------------------------------------------------------------
+# F4: Quarantine mechanism
+# ---------------------------------------------------------------------------
+
+def _load_quarantine() -> dict:
+    if QUARANTINE_FILE.exists():
+        try:
+            with open(QUARANTINE_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_quarantine(data: dict) -> None:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(QUARANTINE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _is_quarantined(case_name: str) -> bool:
+    """True if *case_name* has exhausted its quarantine attempts."""
+    if not case_name:
+        return False
+    entry = _load_quarantine().get(case_name, {})
+    return entry.get("failed_attempts", 0) >= MAX_QUARANTINE_ATTEMPTS
+
+
+def _record_attempt(case_name: str, *, success: bool) -> None:
+    """Record fix attempt.  Reset counter on success, increment on failure."""
+    if not case_name:
+        return
+    quarantine = _load_quarantine()
+    if success:
+        quarantine.pop(case_name, None)
+    else:
+        entry = quarantine.get(case_name, {"failed_attempts": 0, "last_failure": None})
+        entry["failed_attempts"] = entry.get("failed_attempts", 0) + 1
+        entry["last_failure"] = datetime.now(timezone.utc).isoformat()
+        quarantine[case_name] = entry
+    _save_quarantine(quarantine)
+
+
+def _quarantine_snapshot() -> dict:
+    """Current quarantine state for status reporting."""
+    quarantine = _load_quarantine()
+    return {
+        "max_attempts": MAX_QUARANTINE_ATTEMPTS,
+        "quarantined": {
+            name: entry for name, entry in quarantine.items()
+            if entry.get("failed_attempts", 0) >= MAX_QUARANTINE_ATTEMPTS
+        },
+        "at_risk": {
+            name: entry for name, entry in quarantine.items()
+            if 0 < entry.get("failed_attempts", 0) < MAX_QUARANTINE_ATTEMPTS
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Issue selection & formatting
 # ---------------------------------------------------------------------------
 
 _SEVERITY_ORDER = {"FAIL": 0, "WARN": 1}
 
 
-def _pick_most_critical(report: dict) -> dict | None:
-    """Pick the single most critical non-passing result from the report.
+# F5: Bucketed priority classification
 
-    Priority: FAIL before WARN, then by duration (slower = more impactful).
+def _classify_case_bucket(case: dict, benchmark_cases: list[dict]) -> str:
+    """Classify a failing benchmark case into a priority bucket.
+
+    Uses three signals: error category, tool path, and the fragile flag.
+    """
+    from orchestrate.prompts.issue_template import _classify_error
+
+    error_text = case.get("error", "") or ""
+    case_name = case.get("name", "")
+
+    # Resolve tool path and fragile flag from benchmark_cases.yaml
+    tool_path = ""
+    is_fragile = False
+    for bc in benchmark_cases:
+        if bc.get("name") == case_name:
+            tool_path = bc.get("tool", "")
+            is_fragile = bc.get("fragile", False)
+            break
+
+    # 1) Error-category override (e.g. timeout → network_transient)
+    classification = _classify_error(error_text, tool_path)
+    error_bucket = _ERROR_BUCKET_OVERRIDES.get(classification.category)
+    if error_bucket:
+        return error_bucket
+
+    # 2) Config / env issues
+    if "missing" in error_text.lower() and (
+        "env" in error_text.lower() or "key" in error_text.lower()
+    ):
+        return "config_or_env"
+
+    # 3) Tool-path based bucket
+    tool_bucket = _TOOL_BUCKET_MAP.get(tool_path)
+    if tool_bucket:
+        return tool_bucket
+
+    # 4) Fragile flag implies scraper
+    if is_fragile:
+        return "scraper_breakage"
+
+    return "search_degradation"  # default middle priority
+
+
+def _pick_most_critical(report: dict) -> dict | None:
+    """Pick the single most critical non-passing, non-quarantined result.
+
+    Uses bucketed priority:
+      10 api_regression → 20 scraper_breakage → 30 search_degradation
+      → 40 network_transient → 50 config_or_env
+    Within the same bucket: FAIL before WARN, then by duration desc.
     """
     candidates = [
         r for r in report["results"]
-        if r["status"] in _SEVERITY_ORDER
+        if r["status"] in _SEVERITY_ORDER and not _is_quarantined(r["name"])
     ]
     if not candidates:
         return None
-    candidates.sort(key=lambda r: (
-        _SEVERITY_ORDER.get(r["status"], 99),
-        -r.get("duration_sec", 0),
-    ))
-    return candidates[0]
+
+    benchmark_cases = _load_benchmark_cases()
+
+    ranked: list[tuple[int, int, float, dict]] = []
+    for r in candidates:
+        bucket = _classify_case_bucket(r, benchmark_cases)
+        priority = PRIORITY_BUCKETS.get(bucket, 99)
+        severity = _SEVERITY_ORDER.get(r["status"], 99)
+        duration = -r.get("duration_sec", 0)
+        ranked.append((priority, severity, duration, r))
+
+    ranked.sort(key=lambda x: (x[0], x[1], x[2]))
+    return ranked[0][3]
 
 
 def _build_issue_title(case: dict, date_str: str) -> str:
@@ -620,6 +968,7 @@ def cmd_benchmark() -> dict:
         sys.exit(1)
 
     _save_benchmark_report(report)
+    _save_baseline_report(report)  # F3: persist as baseline for regression checks
 
     passed = report.get("passed", 0)
     failed = report.get("failed", 0)
@@ -739,6 +1088,16 @@ def _fix_issue(issue: dict) -> bool:
 
     logger.info("--- Fixing issue #%d: %s ---", number, title)
 
+    case_name = _extract_case_name(title)
+
+    # F4: Quarantine — skip cases that have repeatedly failed across runs
+    if case_name and _is_quarantined(case_name):
+        logger.info(
+            "Case '%s' (issue #%d) is quarantined (>=%d failures) — skipping",
+            case_name, number, MAX_QUARANTINE_ATTEMPTS,
+        )
+        return False
+
     if _branch_exists_remote(branch):
         logger.info("Branch %s already exists on remote — skipping (PR may already exist)", branch)
         return False
@@ -768,7 +1127,6 @@ def _fix_issue(issue: dict) -> bool:
     base_result = _run(["git", "rev-parse", "HEAD"], cwd=str(worktree_path), check=False)
     base_ref = base_result.stdout.strip() if base_result.returncode == 0 else "main"
 
-    case_name = _extract_case_name(title)
     attempt_history: list[dict] = []
 
     try:
@@ -801,6 +1159,8 @@ def _fix_issue(issue: dict) -> bool:
                     backend=backend,
                     preflight=True,
                 )
+                if case_name:
+                    _record_attempt(case_name, success=True)
                 return True
 
             # ----- Run agent -----
@@ -833,13 +1193,88 @@ def _fix_issue(issue: dict) -> bool:
             has_agent_commits = _branch_has_new_commits(worktree_path)
             has_code_changes = has_staged or has_agent_commits
 
-            # ----- Verify BEFORE committing -----
+            # ----- F1: Locked-paths check -----
+            if has_code_changes:
+                forbidden = _validate_changed_files(worktree_path)
+                if forbidden:
+                    logger.warning(
+                        "Attempt %d for issue #%d touched locked paths: %s — rejecting",
+                        attempt, number, forbidden,
+                    )
+                    git_summary = _collect_git_attempt_summary(worktree_path, base_ref)
+                    attempt_history.append({
+                        "attempt": attempt,
+                        "had_code_changes": True,
+                        "backend": backend,
+                        "agent_exit_code": agent_result.returncode,
+                        "summary": f"Rejected: touched locked paths {forbidden}",
+                        "verification": {"pass": False, "json_ok": False},
+                        "git": git_summary,
+                        "agent_stdout": agent_result.stdout or "",
+                        "agent_stderr": agent_result.stderr or "",
+                        "rejected_locked_paths": forbidden,
+                    })
+                    continue
+
+            # ----- F2: Quick gate — fast sanity check -----
+            if has_code_changes:
+                logger.info("Running quick gate (imports + YAML validation) …")
+                quick_passed, quick_details = _run_quick_gate(worktree_path)
+                if not quick_passed:
+                    logger.warning(
+                        "Attempt %d for issue #%d failed quick gate — skipping benchmark",
+                        attempt, number,
+                    )
+                    git_summary = _collect_git_attempt_summary(worktree_path, base_ref)
+                    attempt_history.append({
+                        "attempt": attempt,
+                        "had_code_changes": has_code_changes,
+                        "backend": backend,
+                        "agent_exit_code": agent_result.returncode,
+                        "summary": f"Quick gate failed: {quick_details.get('checks', [])}",
+                        "verification": {"pass": False, "json_ok": False, "quick_gate": quick_details},
+                        "git": git_summary,
+                        "agent_stdout": agent_result.stdout or "",
+                        "agent_stderr": agent_result.stderr or "",
+                    })
+                    continue
+
+            # ----- Verify target case BEFORE committing -----
             logger.info("Verifying fix with benchmark (case=%s) …", case_name or "ALL")
             benchmark_passed, verification_details = _verify_fix_with_details(
                 worktree_path, case_name)
 
-            # ----- Scenario 2: resolved with code → commit now -----
+            # ----- Scenario 2: resolved with code → zero-regression → commit -----
             if benchmark_passed and has_code_changes:
+                # F3: Zero-regression check — run full suite before promoting
+                if not _config.get("skip_regression_check"):
+                    baseline = _load_baseline_report()
+                    if baseline:
+                        logger.info("Running zero-regression check (full suite) …")
+                        no_regress, regress_details = _check_zero_regression(
+                            worktree_path, baseline)
+                        if not no_regress:
+                            logger.warning(
+                                "Attempt %d for issue #%d caused regressions: %s",
+                                attempt, number, regress_details["regressions"],
+                            )
+                            git_summary = _collect_git_attempt_summary(worktree_path, base_ref)
+                            attempt_history.append({
+                                "attempt": attempt,
+                                "had_code_changes": True,
+                                "backend": backend,
+                                "agent_exit_code": agent_result.returncode,
+                                "summary": f"Regression: {regress_details['regressions']}",
+                                "verification": verification_details,
+                                "regression": regress_details,
+                                "git": git_summary,
+                                "agent_stdout": agent_result.stdout or "",
+                                "agent_stderr": agent_result.stderr or "",
+                            })
+                            continue
+                    else:
+                        logger.info("No baseline report found — skipping regression check")
+
                 if has_staged:
                     _run(
                         ["git", "commit", "-m",
@@ -848,6 +1283,8 @@ def _fix_issue(issue: dict) -> bool:
                     )
                 logger.info("Issue #%d resolved with code changes (attempt %d)",
                              number, attempt)
+                if case_name:
+                    _record_attempt(case_name, success=True)
                 return _push_and_create_pr(worktree_path, branch, number, title)
 
             # ----- Scenario 1: resolved without code -----
@@ -863,6 +1300,8 @@ def _fix_issue(issue: dict) -> bool:
                     backend=backend,
                     preflight=False,
                 )
+                if case_name:
+                    _record_attempt(case_name, success=True)
                 return True
 
             # ----- Not resolved — record and retry -----
@@ -899,6 +1338,9 @@ def _fix_issue(issue: dict) -> bool:
             max_attempts=max_attempts,
             branch=branch,
         )
+        # F4: Record failed quarantine attempt
+        if case_name:
+            _record_attempt(case_name, success=False)
         return False
 
     finally:
@@ -1235,8 +1677,6 @@ def cmd_fix() -> None:
 
 def cmd_loop() -> None:
     """Full cycle: run benchmarks then fix open issues."""
-    import time
-
     logger.info("========== Orchestrator loop started ==========")
     start = datetime.now(timezone.utc)
 
@@ -1257,23 +1697,98 @@ def cmd_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
+# F6: Sub-command: daemon — continuous benchmark→fix loop
+# ---------------------------------------------------------------------------
+
+def _write_daemon_status(status: dict) -> None:
+    """Write daemon status to JSON for external monitoring."""
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(DAEMON_STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump(status, f, ensure_ascii=False, indent=2)
+    except OSError:
+        logger.warning("Could not write daemon status to %s", DAEMON_STATUS_FILE)
+
+
+def cmd_daemon(interval: float = 600.0) -> None:
+    """Run the benchmark→fix loop continuously with a configurable interval.
+
+    Writes status to logs/daemon_status.json after each iteration.
+    Handles SIGINT/SIGTERM gracefully.
+    """
+    shutdown_requested = False
+
+    def _handle_signal(signum: int, _frame: object) -> None:
+        nonlocal shutdown_requested
+        sig_name = signal.Signals(signum).name
+        logger.info("Received %s — finishing current iteration then shutting down", sig_name)
+        shutdown_requested = True
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    logger.info("========== Daemon started (interval=%ds) ==========", interval)
+    iteration = 0
+
+    while not shutdown_requested:
+        iteration += 1
+        logger.info("--- Daemon iteration %d ---", iteration)
+        status: dict = {
+            "mode": "daemon",
+            "iteration": iteration,
+            "interval_seconds": interval,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "status": "running",
+            "last_error": None,
+            "quarantine": _quarantine_snapshot(),
+        }
+        _write_daemon_status(status)
+
+        try:
+            cmd_loop()
+            status["status"] = "completed"
+        except Exception as exc:
+            logger.exception("Daemon iteration %d failed: %s", iteration, exc)
+            status["status"] = "error"
+            status["last_error"] = str(exc)[:1000]
+
+        status["finished_at"] = datetime.now(timezone.utc).isoformat()
+        status["quarantine"] = _quarantine_snapshot()
+        _write_daemon_status(status)
+
+        if shutdown_requested:
+            break
+
+        logger.info("Sleeping %ds before next iteration …", interval)
+        # Sleep in small increments to allow signal handling
+        sleep_remaining = interval
+        while sleep_remaining > 0 and not shutdown_requested:
+            chunk = min(sleep_remaining, 5.0)
+            time.sleep(chunk)
+            sleep_remaining -= chunk
+
+    logger.info("========== Daemon stopped (after %d iterations) ==========", iteration)
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="CIDector orchestrator — benchmark, fix, and loop",
+        description="CIDector orchestrator — benchmark, fix, loop, and daemon",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             sub-commands:
               benchmark   Run benchmark suite; create GitHub issue on failure
               fix         Pick up open claude-fix issues; fix with selected agent backend
               loop        Full cycle: benchmark then fix
+              daemon      Continuous loop with configurable interval and graceful shutdown
         """),
     )
     parser.add_argument(
         "command",
-        choices=["benchmark", "fix", "loop"],
+        choices=["benchmark", "fix", "loop", "daemon"],
         help="Sub-command to run",
     )
     parser.add_argument(
@@ -1297,10 +1812,19 @@ def main() -> None:
             f"(default: {_config['backend']}; env: CIDECTOR_AGENT_BACKEND)"
         ),
     )
+    parser.add_argument(
+        "--interval", type=float, default=600.0,
+        help="Daemon poll interval in seconds (default: 600)",
+    )
+    parser.add_argument(
+        "--no-regression-check", action="store_true",
+        help="Skip zero-regression check during fix verification",
+    )
     args = parser.parse_args()
 
     _config["max_issues"] = args.max_issues
     _config["max_fix_attempts"] = args.max_attempts
+    _config["skip_regression_check"] = args.no_regression_check
     try:
         _config["backend"] = _normalize_backend(args.backend)
     except ValueError as exc:
@@ -1312,6 +1836,7 @@ def main() -> None:
         "benchmark": cmd_benchmark,
         "fix": cmd_fix,
         "loop": cmd_loop,
+        "daemon": lambda: cmd_daemon(interval=args.interval),
     }
     dispatch[args.command]()
 
